@@ -1,0 +1,193 @@
+/* ==================================================================
+   NovelFlow 视觉终稿 · 全局打磨
+   ------------------------------------------------------------------
+   职责（仅做「让界面成一体」的事，不另起一套配色）：
+   1. 把 antd 组件强制收敛到暗色外壳调性 + 青(#4DD0D9)主色；
+   2. 统一动效缓动 cubic-bezier(.2,0,0,1)，时长压在 150–250ms；
+   3. 收敛 antd 浮层（select / dropdown 选项）观感，避免「深壳 + 亮弹窗」。
+
+   说明：App.vue 的 a-config-provider 在启动期按 shellTheme 生成算法主题，
+   但其 theme 对象是静态的（不随外壳明暗切换而更新）。本项目外壳默认深墨蓝，
+   故此处以 :root 覆盖 antd 的组件级 CSS 变量，确保包括 portal 到 body 的
+   下拉 / 浮层在内的全部 antd 组件都呈暗色外壳观感。
+   （若未来需要外壳明暗联动 antd，应让 App.vue 的 ConfigProvider 主题响应式——
+   超出本文件职责范围。）
+   ================================================================== */
+
+:root {
+  /* 主色：青 #4DD0D9（覆盖 App.vue 里偏深的 #2aa6b0，统一品牌青） */
+  --ant-color-primary: #4dd0d9;
+  --ant-color-primary-hover: #6fdde4;
+  --ant-color-primary-active: #2aa6b0;
+  --ant-color-primary-bg: rgba(77, 208, 217, 0.1);
+  --ant-color-primary-bg-hover: rgba(77, 208, 217, 0.16);
+  --ant-color-primary-border: rgba(77, 208, 217, 0.4);
+  --ant-color-link: #4dd0d9;
+  --ant-color-link-hover: #6fdde4;
+
+  /* 辅金（用于警告 / 自定义等语义点缀） */
+  --ant-color-warning: #c9a227;
+  --ant-color-warning-hover: #d8b54a;
+  --ant-color-error: #c86a63;
+  --ant-color-success: #6fae7f;
+  --ant-color-info: #6f9dc0;
+
+  /* 文本层级：暗色外壳上的可读梯度 */
+  --ant-color-text: #e8eef4;
+  --ant-color-text-secondary: #b9c8d6;
+  --ant-color-text-tertiary: #93a1ad;
+  --ant-color-text-quaternary: #7c8ea3;
+
+  /* 容器 / 浮层底：与外壳同调 */
+  --ant-color-bg-container: #1b2634;
+  --ant-color-bg-elevated: #22303f;
+  --ant-color-bg-popover: #22303f;
+  --ant-color-bg-spell-check: #22303f;
+
+  /* 描边：细描、低对比，不用 1px 黑线 */
+  --ant-color-border: rgba(148, 172, 196, 0.2);
+  --ant-color-border-secondary: rgba(148, 172, 196, 0.14);
+
+  /* 填充：用于 hover / 选中底，去饱和 */
+  --ant-color-fill: rgba(255, 255, 255, 0.04);
+  --ant-color-fill-secondary: rgba(255, 255, 255, 0.06);
+  --ant-color-fill-tertiary: rgba(255, 255, 255, 0.08);
+  --ant-color-fill-quaternary: rgba(255, 255, 255, 0.1);
+
+  /* 圆角：与令牌一致（16–18 面板 / 10 控件） */
+  --ant-border-radius: 10px;
+  --ant-border-radius-lg: 16px;
+  --ant-border-radius-sm: 7px;
+
+  /* 统一动效：与令牌一致的缓动；界面动效 ≤ 250ms（无回弹） */
+  --ant-motion-ease-in-out: cubic-bezier(0.2, 0, 0, 1);
+  --ant-motion-ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ant-motion-ease-in-out-circ: cubic-bezier(0.2, 0, 0, 0, 1);
+  --ant-motion-duration-slow: 0.25s;
+  --ant-motion-duration-mid: 0.2s;
+  --ant-motion-duration-fast: 0.15s;
+}
+
+/* ---------------- antd 组件收敛 ---------------- */
+
+/* 输入框：暗底、青色聚焦环，不用黑描边 */
+.ant-input,
+.ant-input-affix-wrapper,
+.ant-input-number,
+.ant-select-selector,
+.ant-picker {
+  background: #0f1720 !important;
+  border-color: var(--nf-shell-line) !important;
+  color: #e8eef4 !important;
+  border-radius: var(--nf-r-ctl) !important;
+}
+.ant-input::placeholder,
+.ant-input-affix-wrapper .ant-input::placeholder {
+  color: var(--nf-on-dark-faint) !important;
+}
+.ant-input:focus,
+.ant-input-focused,
+.ant-input-affix-wrapper-focused,
+.ant-input-affix-wrapper:focus,
+.ant-select-focused .ant-select-selector,
+.ant-picker-focused {
+  border-color: rgba(77, 208, 217, 0.55) !important;
+  box-shadow: 0 0 0 2px rgba(77, 208, 217, 0.14) !important;
+}
+
+/* 文本域：去掉默认内阴影，给柔和底 */
+.ant-input-textarea textarea {
+  background: #0f1720 !important;
+  color: #e8eef4 !important;
+}
+.ant-input-textarea textarea::placeholder {
+  color: var(--nf-on-dark-faint) !important;
+}
+
+/* 下拉 / 浮层选中色：青，而非默认蓝 */
+.ant-select-item-option-selected:not(.ant-select-item-option-disabled) {
+  background: rgba(77, 208, 217, 0.14) !important;
+  color: #e8eef4 !important;
+}
+.ant-select-item-option-active:not(.ant-select-item-option-disabled) {
+  background: rgba(148, 172, 196, 0.12) !important;
+}
+.ant-select-item-option-content {
+  color: #b9c8d6;
+}
+.ant-select-dropdown,
+.ant-dropdown-menu,
+.ant-picker-dropdown .ant-picker-panel-container {
+  background: #22303f !important;
+  border: 1px solid rgba(255, 255, 255, 0.07) !important;
+  box-shadow: 0 1px 2px rgba(8, 14, 19, 0.3), 0 12px 32px rgba(8, 14, 19, 0.34) !important;
+  border-radius: 14px !important;
+  overflow: hidden;
+}
+
+/* radio-button 分段控制：选中态走青，不用默认蓝 */
+.ant-radio-button-wrapper-checked:not(.ant-radio-button-wrapper-disabled) {
+  background: #4dd0d9 !important;
+  border-color: #4dd0d9 !important;
+  color: #062028 !important;
+}
+.ant-radio-button-wrapper-checked:not(.ant-radio-button-wrapper-disabled)::before {
+  background-color: #4dd0d9 !important;
+}
+.ant-radio-button-wrapper:hover {
+  color: #4dd0d9 !important;
+}
+
+/* 默认 / 文本按钮在暗壳上的文字色 */
+.ant-btn:not(.ant-btn-primary):not(.ant-btn-dangerous) {
+  color: #b9c8d6;
+}
+.ant-btn-default {
+  border-color: var(--nf-shell-line);
+  background: var(--nf-shell-700);
+}
+.ant-btn-default:hover {
+  color: #4dd0d9 !important;
+  border-color: rgba(77, 208, 217, 0.4) !important;
+  background: rgba(77, 208, 217, 0.08) !important;
+}
+
+/* 主色按钮：青渐层，文字深墨蓝，不用廉价大黑阴影 */
+.ant-btn-primary {
+  background: linear-gradient(180deg, #58d7df 0%, #2aa6b0 100%) !important;
+  border-color: transparent !important;
+  color: #062028 !important;
+  font-weight: 600;
+  box-shadow: 0 2px 8px rgba(77, 208, 217, 0.28) !important;
+}
+.ant-btn-primary:hover {
+  background: linear-gradient(180deg, #6fdde4 0%, #2aa6b0 100%) !important;
+}
+.ant-btn-dangerous {
+  color: #e08b7a !important;
+  border-color: rgba(200, 106, 99, 0.4) !important;
+  background: rgba(200, 106, 99, 0.08) !important;
+}
+
+/* 弹层 / 抽屉统一入场缓动（抽屉 220ms 缓出，避免回弹） */
+.ant-drawer-content-wrapper,
+.ant-modal-mask,
+.ant-drawer-mask {
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1) !important;
+}
+
+/* 进度环 / 进度条：青色主轨 */
+.ant-progress-circle .ant-progress-circle-path,
+.ant-progress-bg {
+  stroke: #4dd0d9;
+}
+
+/* 标签页（检查器分栏）文字在暗壳上的可读性 */
+.ant-tabs-tab-btn {
+  color: var(--nf-on-dark-faint);
+}
+
+/* Empty 在暗壳里的占位图去灰、提亮一点点 */
+.ant-empty-description {
+  color: var(--nf-on-dark-faint);
+}

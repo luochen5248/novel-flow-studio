@@ -1,0 +1,189 @@
+/* ==================================================================
+   NovelFlow 设计令牌
+   ------------------------------------------------------------------
+   原则：外壳深墨蓝、画布双模式（宣纸暖白 / 夜航深蓝）；
+        青 #4DD0D9 主、金 #C9A227 辅；阴影克制双层；禁纯黑、禁霓虹。
+   ================================================================== */
+
+:root {
+  /* ---------- 外壳 ---------- */
+  --nf-shell-900: #0f1720;
+  --nf-shell-850: #111a24;
+  --nf-shell-800: #131c26;
+  --nf-shell-700: #1b2634;
+  --nf-shell-600: #22303f;
+  --nf-shell-line: rgba(148, 172, 196, 0.14);
+  --nf-shell-line-soft: rgba(148, 172, 196, 0.08);
+
+  /* ---------- 画布 ---------- */
+  --nf-paper: #faf8f4;
+  --nf-paper-deep: #f3efe7;
+  --nf-night: #0b1218;
+  --nf-night-deep: #080e13;
+
+  /* ---------- 强调 ---------- */
+  --nf-teal: #4dd0d9;
+  --nf-teal-deep: #2aa6b0;
+  --nf-teal-mist: rgba(77, 208, 217, 0.16);
+  --nf-gold: #c9a227;
+  --nf-gold-deep: #a9881d;
+  --nf-gold-mist: rgba(201, 162, 39, 0.16);
+
+  /* 语义色一律去饱和 */
+  --nf-ok: #6fae7f;
+  --nf-warn: #c9a227;
+  --nf-danger: #c86a63;
+  --nf-info: #6f9dc0;
+
+  /* ---------- 文本 ---------- */
+  --nf-ink-strong: #16222c;
+  --nf-ink: #33424f;
+  --nf-ink-soft: #6b7b89;
+  --nf-ink-faint: #93a1ad;
+  --nf-on-dark-strong: #e8eef4;
+  --nf-on-dark: #b9c8d6;
+  --nf-on-dark-soft: #7c8ea3;
+  --nf-on-dark-faint: #5a6b7e;
+
+  /* ---------- 字阶（1.25 – 1.6 模块化） ---------- */
+  --nf-font: system-ui, 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --nf-fs-2xs: 11px;
+  --nf-fs-xs: 12px;
+  --nf-fs-sm: 13px;
+  --nf-fs-md: 15px;
+  --nf-fs-lg: 18px;
+  --nf-fs-xl: 21px;
+  --nf-fs-2xl: 26px;
+  --nf-lh-tight: 1.35;
+  --nf-lh-body: 1.6;
+
+  /* ---------- 圆角 ---------- */
+  --nf-r-card: 18px;
+  --nf-r-card-sm: 14px;
+  --nf-r-ctl: 10px;
+  --nf-r-chip: 999px;
+
+  /* ---------- 阴影（克制双层） ---------- */
+  --nf-shadow-card: 0 1px 2px rgba(15, 23, 32, 0.05), 0 8px 24px rgba(15, 23, 32, 0.06);
+  --nf-shadow-card-hover: 0 2px 4px rgba(15, 23, 32, 0.06), 0 14px 34px rgba(15, 23, 32, 0.1);
+  --nf-shadow-card-night: 0 1px 2px rgba(0, 0, 0, 0.24), 0 8px 24px rgba(0, 0, 0, 0.32);
+  --nf-shadow-card-night-hover: 0 2px 5px rgba(0, 0, 0, 0.28), 0 16px 38px rgba(0, 0, 0, 0.4);
+  --nf-shadow-panel: 0 1px 2px rgba(8, 14, 19, 0.3), 0 12px 32px rgba(8, 14, 19, 0.34);
+  --nf-shadow-pop: 0 4px 10px rgba(8, 14, 19, 0.24), 0 18px 46px rgba(8, 14, 19, 0.32);
+
+  /* ---------- 动效 ---------- */
+  --nf-ease: cubic-bezier(0.2, 0, 0, 1);
+  --nf-dur-fast: 150ms;
+  --nf-dur: 200ms;
+  --nf-dur-slow: 250ms;
+
+  /* ---------- 节点主色族：柔和渐层（浅色画布） ---------- */
+  --nf-node-teal-bg: linear-gradient(168deg, #ffffff 0%, #f5fbfc 44%, #e7f6f7 100%);
+  --nf-node-teal-bar: linear-gradient(180deg, #6fdde4 0%, #2aa6b0 100%);
+  --nf-node-teal-ink: #1d5f66;
+  --nf-node-teal-ring: rgba(77, 208, 217, 0.42);
+
+  --nf-node-mist-bg: linear-gradient(168deg, #ffffff 0%, #f6f8fb 44%, #e9eef5 100%);
+  --nf-node-mist-bar: linear-gradient(180deg, #9fbed8 0%, #6f9dc0 100%);
+  --nf-node-mist-ink: #33566f;
+  --nf-node-mist-ring: rgba(111, 157, 192, 0.4);
+
+  --nf-node-gold-bg: linear-gradient(168deg, #fffdf6 0%, #fbf5e6 44%, #f4ecda 100%);
+  --nf-node-gold-bar: linear-gradient(180deg, #e0c464 0%, #a9881d 100%);
+  --nf-node-gold-ink: #6d5417;
+  --nf-node-gold-ring: rgba(201, 162, 39, 0.4);
+
+  --nf-node-clay-bg: linear-gradient(168deg, #fffaf7 0%, #faf1eb 44%, #f2e5dc 100%);
+  --nf-node-clay-bar: linear-gradient(180deg, #d99f83 0%, #b1705a 100%);
+  --nf-node-clay-ink: #7a4128;
+  --nf-node-clay-ring: rgba(177, 112, 90, 0.36);
+
+  --nf-node-ink-bg: linear-gradient(168deg, #ffffff 0%, #f2f4f7 44%, #e5e9ef 100%);
+  --nf-node-ink-bar: linear-gradient(180deg, #6b7b89 0%, #33424f 100%);
+  --nf-node-ink-ink: #26323d;
+  --nf-node-ink-ring: rgba(51, 66, 79, 0.32);
+
+  --nf-node-sage-bg: linear-gradient(168deg, #fbfdfa 0%, #f1f7ef 44%, #e4efe2 100%);
+  --nf-node-sage-bar: linear-gradient(180deg, #93c39a 0%, #5f9768 100%);
+  --nf-node-sage-ink: #35603f;
+  --nf-node-sage-ring: rgba(95, 151, 104, 0.36);
+
+  /* 默认（浅画布） */
+  --nf-card-bg: var(--nf-node-teal-bg);
+  --nf-card-bar: var(--nf-node-teal-bar);
+  --nf-card-ink: var(--nf-node-teal-ink);
+  --nf-card-ring: var(--nf-node-teal-ring);
+  --nf-card-title: var(--nf-ink-strong);
+  --nf-card-body: var(--nf-ink);
+  --nf-card-meta: var(--nf-ink-soft);
+  --nf-card-hairline: rgba(21, 34, 44, 0.08);
+}
+
+/* ---------------- 画布 · 夜间 ---------------- */
+.nf-canvas--dark {
+  --nf-node-teal-bg: linear-gradient(168deg, #182b36 0%, #14232e 46%, #101c26 100%);
+  --nf-node-mist-bg: linear-gradient(168deg, #17262f 0%, #142130 46%, #101a26 100%);
+  --nf-node-gold-bg: linear-gradient(168deg, #221e15 0%, #1d1a14 46%, #171410 100%);
+  --nf-node-clay-bg: linear-gradient(168deg, #241a17 0%, #1f1715 46%, #181211 100%);
+  --nf-node-ink-bg: linear-gradient(168deg, #1a222c 0%, #161e27 46%, #111821 100%);
+  --nf-node-sage-bg: linear-gradient(168deg, #16241b 0%, #141f1a 46%, #101a15 100%);
+
+  --nf-card-title: var(--nf-on-dark-strong);
+  --nf-card-body: var(--nf-on-dark);
+  --nf-card-meta: var(--nf-on-dark-soft);
+  --nf-card-hairline: rgba(180, 205, 226, 0.1);
+  --nf-shadow-card: var(--nf-shadow-card-night);
+  --nf-shadow-card-hover: var(--nf-shadow-card-night-hover);
+}
+
+/* ---------------- 外壳 · 浅色（可选） ---------------- */
+.nf-shell--light {
+  --nf-shell-900: #eef1f4;
+  --nf-shell-800: #f6f8fa;
+  --nf-shell-700: #ffffff;
+  --nf-shell-line: rgba(21, 34, 44, 0.1);
+  --nf-shell-line-soft: rgba(21, 34, 44, 0.06);
+  --nf-on-dark-strong: #16222c;
+  --nf-on-dark: #33424f;
+  --nf-on-dark-soft: #6b7b89;
+  --nf-on-dark-faint: #93a1ad;
+  --nf-shadow-panel: 0 1px 2px rgba(21, 34, 44, 0.06), 0 12px 32px rgba(21, 34, 44, 0.08);
+}
+
+/* ---------------- 节点主色族快捷类 ---------------- */
+.nf-node--teal {
+  --nf-card-bg: var(--nf-node-teal-bg);
+  --nf-card-bar: var(--nf-node-teal-bar);
+  --nf-card-ink: var(--nf-node-teal-ink);
+  --nf-card-ring: var(--nf-node-teal-ring);
+}
+.nf-node--mist {
+  --nf-card-bg: var(--nf-node-mist-bg);
+  --nf-card-bar: var(--nf-node-mist-bar);
+  --nf-card-ink: var(--nf-node-mist-ink);
+  --nf-card-ring: var(--nf-node-mist-ring);
+}
+.nf-node--gold {
+  --nf-card-bg: var(--nf-node-gold-bg);
+  --nf-card-bar: var(--nf-node-gold-bar);
+  --nf-card-ink: var(--nf-node-gold-ink);
+  --nf-card-ring: var(--nf-node-gold-ring);
+}
+.nf-node--clay {
+  --nf-card-bg: var(--nf-node-clay-bg);
+  --nf-card-bar: var(--nf-node-clay-bar);
+  --nf-card-ink: var(--nf-node-clay-ink);
+  --nf-card-ring: var(--nf-node-clay-ring);
+}
+.nf-node--ink {
+  --nf-card-bg: var(--nf-node-ink-bg);
+  --nf-card-bar: var(--nf-node-ink-bar);
+  --nf-card-ink: var(--nf-node-ink-ink);
+  --nf-card-ring: var(--nf-node-ink-ring);
+}
+.nf-node--sage {
+  --nf-card-bg: var(--nf-node-sage-bg);
+  --nf-card-bar: var(--nf-node-sage-bar);
+  --nf-card-ink: var(--nf-node-sage-ink);
+  --nf-card-ring: var(--nf-node-sage-ring);
+}

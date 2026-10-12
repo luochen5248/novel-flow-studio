@@ -1,0 +1,45 @@
+# NovelFlow Studio · Windows 安装包云端构建与发布
+#
+# 触发方式：
+#   1. 推送 v* 标签（git tag v0.1.1 && git push origin v0.1.1）→ 自动构建并发布到 Releases
+#   2. GitHub 页面手动触发（workflow_dispatch）
+#
+# 发布产物：NovelFlow-Studio-Setup-<版本>.exe + latest.yml（electron-updater 的更新源元数据）
+# 权限：内置 GITHUB_TOKEN 即可（contents: write），无需额外配置个人 Token。
+
+name: 发布 Windows 安装包
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建 exe 并发布 Release
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查 + 构建前端产物
+        run: npm run build
+
+      - name: 打包 exe 并发布到 GitHub Releases
+        run: npx electron-builder --win --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,70 @@
+{
+  "name": "novelflow-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "小说时间线流程图工坊 —— 为长篇小说作者准备的本地故事脉络绘制工具",
+  "main": "electron/main.cjs",
+  "author": "NovelFlow",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/luochen5248/novel-flow-studio.git"
+  },
+  "scripts": {
+    "dev": "vite",
+    "dev:electron": "electron electron/main.cjs --dev",
+    "build": "vue-tsc --noEmit && vite build",
+    "pack": "npm run build && electron-builder --win --publish never",
+    "preview": "vite preview",
+    "type-check": "vue-tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "ant-design-vue": "^4.2.6",
+    "electron-updater": "^6.3.9",
+    "pinia": "^2.2.6",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/test-utils": "^2.4.6",
+    "electron": "^33.3.1",
+    "electron-builder": "^25.1.8",
+    "jsdom": "^30.1.2",
+    "typescript": "~5.6.3",
+    "vite": "^6.0.5",
+    "vitest": "^2.1.8",
+    "vue-tsc": "^2.1.10"
+  },
+  "build": {
+    "appId": "com.novelflow.studio",
+    "productName": "小说时间线工坊",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "NovelFlow-Studio-Setup-${version}.${ext}",
+      "deleteAppDataOnUninstall": false
+    },
+    "publish": {
+      "provider": "github"
+    }
+  }
+}

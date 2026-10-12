@@ -1,0 +1,136 @@
+@import './tokens.css';
+
+/* ==================================================================
+   全局基础层：只做「让界面不崩」的事，具体审美交给各组件
+   ================================================================== */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--nf-font);
+  font-size: var(--nf-fs-sm);
+  color: var(--nf-on-dark);
+  background: var(--nf-shell-900);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+button,
+input,
+textarea,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+::selection {
+  background: var(--nf-teal-mist);
+  color: var(--nf-ink-strong);
+}
+
+/* 细描滚动条，与深墨蓝外壳同调 */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 172, 196, 0.2);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 172, 196, 0.34);
+  background-clip: content-box;
+}
+
+/* ---------------- 通用动效 ---------------- */
+@keyframes nf-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes nf-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* 时间轨道的呼吸光晕：慢、轻、不抢戏 */
+@keyframes nf-rail-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+@keyframes nf-dash-drift {
+  to {
+    stroke-dashoffset: -12;
+  }
+}
+
+.nf-fade-up {
+  animation: nf-fade-up var(--nf-dur-slow) var(--nf-ease) both;
+}
+
+/* ---------------- 工具类 ---------------- */
+.nf-mono-label {
+  font-size: var(--nf-fs-2xs);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--nf-on-dark-faint);
+}
+
+.nf-time-badge {
+  font-size: var(--nf-fs-2xs);
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+}
+
+.nf-scroll {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* ---------------- Ant Design Vue 收敛 ---------------- */
+.ant-message {
+  font-family: var(--nf-font);
+}
+
+.ant-tooltip-inner {
+  font-family: var(--nf-font);
+  font-size: var(--nf-fs-xs);
+  border-radius: var(--nf-r-ctl);
+}
+
+.ant-drawer-body {
+  font-family: var(--nf-font);
+}
