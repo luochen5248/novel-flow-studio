@@ -4,6 +4,7 @@ import { useFlowStore } from '@/stores/useFlowStore'
 import { useUiStore } from '@/stores/useUiStore'
 import ExportMenu from '@/components/toolbar/ExportMenu.vue'
 import UpdateDialog from '@/components/common/UpdateDialog.vue'
+import GrsaiKeyDialog from '@/components/common/GrsaiKeyDialog.vue'
 
 const store = useFlowStore()
 const ui = useUiStore()
@@ -11,6 +12,7 @@ const ui = useUiStore()
 /** 仅 Electron 桌面环境显示「检查更新」入口（浏览器里走不了 electron-updater） */
 const isDesktop = !!(window as unknown as { electronAPI?: unknown }).electronAPI
 const updateDialog = ref<InstanceType<typeof UpdateDialog> | null>(null)
+const keyDialog = ref<InstanceType<typeof GrsaiKeyDialog> | null>(null)
 
 const editing = ref(false)
 const draft = ref('')
@@ -102,6 +104,18 @@ const doneCount = computed(() => store.nodes.filter((n) => n.status === 'done').
       </button>
 
       <button
+        v-if="isDesktop"
+        class="nf-header__icon"
+        title="AI 生图密钥设置（grsai，仅保存在本机）"
+        @click="keyDialog?.open()"
+      >
+        <svg viewBox="0 0 16 16" width="16" height="16">
+          <circle cx="5.4" cy="8" r="2.4" fill="none" stroke="currentColor" stroke-width="1.3" />
+          <path d="M7.8 8 H13.4 M11.4 8 V10.2 M13 8 V9.6" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+        </svg>
+      </button>
+
+      <button
         class="nf-header__icon"
         :class="{ 'is-on': ui.devConsoleOpen }"
         title="开发者 / AI 控制台（window.NovelFlow 全部方法）"
@@ -139,6 +153,7 @@ const doneCount = computed(() => store.nodes.filter((n) => n.status === 'done').
     </div>
 
     <UpdateDialog ref="updateDialog" />
+    <GrsaiKeyDialog ref="keyDialog" />
   </header>
 </template>
 

@@ -81,31 +81,34 @@ function writeGrsaiKey(key) {
 /* grsai 代理：file:// 下的 /api/grsai/* → 真实 API + 注入密钥 + 补 CORS               */
 /* ------------------------------------------------------------------ */
 
-function setupGrsaiProxy(): void {
+function setupGrsaiProxy() {
   const ses = session.defaultSession
 
   // 1) 重定向：file:///api/grsai/xxx → https://grsai.dakka.com.cn/xxx
   //    （生产模式 loadFile 是 file:// 协议，根相对路径 fetch 会落到 file:///api/grsai/...）
-  ses.webRequest.onBeforeRequest(
-    { urls: ['file:///*/api/grsai/*', 'file://*/*/api/grsai/*'] },
-    (details, callback) => {
-      const index = details.url.indexOf(GRSAI_PREFIX)
-      if (index < 0) {
-        callback({})
-        return
-      }
-      const rest = details.url.slice(index + GRSAI_PREFIX.length)
-      callback({ redirectURL: `${GRSAI_TARGET}${rest}` })
+  //    用 JS 过滤而不是 match-pattern：file 协议的通配 host 不可靠，逐条判断最稳。
+  ses.webRequest.onBeforeRequest((details, callback) => {
+    if (!details.url.startsWith('file://')) {
+      callback({})
+      return
     }
-  )
+    const index = details.url.indexOf(GRSAI_PREFIX)
+    if (index < 0) {
+      callback({})
+      return
+    }
+    const rest = details.url.slice(index + GRSAI_PREFIX.length)
+    callback({ redirectURL: `${GRSAI_TARGET}${rest}` })
+  })
 
   // 2) 注入密钥 + 抹掉 file:// 的 Origin（避免服务端风控/校验）
+  //    OPTIONS 预检不注入：部分服务端对带 Authorization 的预检会直接拒答，导致预检失败
   ses.webRequest.onBeforeSendHeaders(
     { urls: [`${GRSAI_TARGET}/*`] },
     (details, callback) => {
       const headers = { ...details.requestHeaders }
       const key = resolveGrsaiKey()
-      if (key) headers['Authorization'] = `Bearer ${key}`
+      if (key && details.method !== 'OPTIONS') headers['Authorization'] = `Bearer ${key}`
       delete headers['Origin']
       delete headers['Referer']
       callback({ requestHeaders: headers })
@@ -135,7 +138,7 @@ function pushUpdateStatus(payload) {
   }
 }
 
-function setupAutoUpdater(): void {
+function setupAutoUpdater() {
   // 开发态不初始化：electron-updater 在未打包环境必然报错
   if (!app.isPackaged) return
 
@@ -186,9 +189,9 @@ function setupAutoUpdater(): void {
 /* 窗口与生命周期                                                       */
 /* ------------------------------------------------------------------ */
 
-let mainWindow: BrowserWindow | null = null
+let mainWindow = null
 
-function createWindow(): void {
+function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
