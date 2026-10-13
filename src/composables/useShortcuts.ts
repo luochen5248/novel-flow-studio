@@ -109,15 +109,24 @@ export function useShortcuts(hooks: ShortcutHooks): void {
       return
     }
     if (key === 'Delete' || key === 'Backspace') {
+      // D5：边选中非空删边，节点选中非空删节点，两者都选中则两类都删。
+      // isTyping（:59 整个 handler 的守卫）与 ui.locked（:95）双重守卫天然覆盖本分支。
       const ids = [...store.selectedIds]
-      if (!ids.length) return
+      const edgeId = ui.selectedEdgeId
+      if (!ids.length && !edgeId) return
       e.preventDefault()
       store.commit('删除所选')
       for (const id of ids) store.removeNode(id, { silent: true })
+      if (edgeId) {
+        store.removeEdge(edgeId, { silent: true })
+        ui.clearEdgeSelection()
+      }
       return
     }
     if (key === 'Escape') {
       store.clearSelection()
+      // G7：与画布点背景清空边选中的行为对齐，Esc 同时清边选中
+      ui.clearEdgeSelection()
     }
   }
 

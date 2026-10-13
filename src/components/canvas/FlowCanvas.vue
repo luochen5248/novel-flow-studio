@@ -6,7 +6,7 @@ import { useUiStore } from '@/stores/useUiStore'
 import { useViewport } from '@/composables/useViewport'
 import { useNodeDrag } from '@/composables/useNodeDrag'
 import { useSelection } from '@/composables/useSelection'
-import { boundsOf, buildEdgeGeom } from '@/core/geometry'
+import { boundsOf, buildEdgeGeom, pickHandleOnNode } from '@/core/geometry'
 import CanvasGrid from './CanvasGrid.vue'
 import TimeRail from './TimeRail.vue'
 import EdgeLayer from './EdgeLayer.vue'
@@ -29,14 +29,15 @@ const selection = useSelection(svgRef, viewport)
 
 const spaceDown = ref(false)
 const panning = ref(false)
-const selectedEdgeId = ref<string | null>(null)
 
-/** 正在拉线：从某个 port 出发 */
+/** 正在拉线：从某个 port 出发。rawX/rawY 是吸附前的原始指针世界坐标 */
 const pending = ref<{
   sourceId: string
   side: PortSide
   x: number
   y: number
+  rawX: number
+  rawY: number
   moved: boolean
 } | null>(null)
 
@@ -112,7 +113,7 @@ function endPan(): void {
 }
 
 function onBackgroundDown(e: PointerEvent): void {
-  selectedEdgeId.value = null
+  ui.clearEdgeSelection()
   if (e.button === 1 || spaceDown.value || e.button === 2) {
     e.preventDefault()
     startPan(e)
@@ -152,9 +153,10 @@ function hitNode(clientX: number, clientY: number): StoryNode | null {
 function onPortDown(e: PointerEvent, node: StoryNode, side: PortSide): void {
   if (ui.locked) return
   const p = svgPoint(e.clientX, e.clientY)
-  pending.value = { sourceId: node.id, side, x: p.x, y: p.y, moved: false }
+  pending.value = { sourceId: node.id, side, x: p.x, y: p.y, rawX: p.x, rawY: p.y, moved: false }
   window.addEventListener('pointermove', onPendingMove)
   window.addEventListener('pointerup', onPendingUp)
+  window.addEventListener('keydown', onPendingEsc, true)
 }
 
 function onPendingMove(e: PointerEvent): void {
@@ -164,6 +166,9 @@ function onPendingMove(e: PointerEvent): void {
   if (Math.abs(p.x - cur.x) + Math.abs(p.y - cur.y) > 6) {
     cur.moved = true
   }
+  // 先记吸附前的原始指针坐标（松手时用它推算目标端锚点），再被吸到中心
+  cur.rawX = p.x
+  cur.rawY = p.y
   cur.x = p.x
   cur.y = p.y
   // 最近邻吸附：靠近任意卡片即高亮并把线头吸到其中心，无需精准压住
@@ -179,10 +184,32 @@ function onPendingMove(e: PointerEvent): void {
   }
 }
 
+/**
+ * 拉线期间按 Esc 取消（G1/G8）。
+ * capture 阶段拦截 + stopPropagation：既抢在 useShortcuts 的全局 Esc
+ * （clearSelection）之前，又不让它触发 —— 取消拉线不该连带丢掉节点选中态。
+ * 仅在 pending 激活期间挂载（onPortDown 挂 / 退出即摘）。
+ */
+function onPendingEsc(e: KeyboardEvent): void {
+  if (e.key !== 'Escape') return
+  e.stopPropagation()
+  cancelPending()
+}
+
+function cancelPending(): void {
+  window.removeEventListener('pointermove', onPendingMove)
+  window.removeEventListener('pointerup', onPendingUp)
+  window.removeEventListener('keydown', onPendingEsc, true)
+  pending.value = null
+  linkSnapTargetId.value = null
+  ui.notify('已取消连线')
+}
+
 function onPendingUp(e: PointerEvent): void {
   const cur = pending.value
   window.removeEventListener('pointermove', onPendingMove)
   window.removeEventListener('pointerup', onPendingUp)
+  window.removeEventListener('keydown', onPendingEsc, true)
   pending.value = null
   const snapped = linkSnapTargetId.value
   linkSnapTargetId.value = null
@@ -190,8 +217,12 @@ function onPendingUp(e: PointerEvent): void {
 
   // 优先连到吸附目标
   if (cur.moved && snapped && snapped !== cur.sourceId) {
+    const target = store.nodes.find((n) => n.id === snapped)
     const kind = cur.side === 'left' || cur.side === 'right' ? 'branch' : 'flow'
-    store.connectNodes(cur.sourceId, snapped, kind)
+    const targetHandle = target
+      ? pickHandleOnNode(target, { x: cur.rawX, y: cur.rawY })
+      : undefined
+    store.connectNodes(cur.sourceId, snapped, kind, { sourceHandle: cur.side, targetHandle })
     ui.notify('已连线')
     return
   }
@@ -200,7 +231,8 @@ function onPendingUp(e: PointerEvent): void {
     const target = hitNode(e.clientX, e.clientY)
     if (target && target.id !== cur.sourceId) {
       const kind = cur.side === 'left' || cur.side === 'right' ? 'branch' : 'flow'
-      store.connectNodes(cur.sourceId, target.id, kind)
+      const targetHandle = pickHandleOnNode(target, { x: cur.rawX, y: cur.rawY })
+      store.connectNodes(cur.sourceId, target.id, kind, { sourceHandle: cur.side, targetHandle })
       ui.notify('已连线')
     }
     return
@@ -216,6 +248,7 @@ function onReconnectStart(e: PointerEvent, id: string, end: 'source' | 'target')
   reconnect.value = { edgeId: id, end, x: p.x, y: p.y }
   window.addEventListener('pointermove', onReconnectMove)
   window.addEventListener('pointerup', onReconnectUp)
+  window.addEventListener('keydown', onReconnectEsc, true)
 }
 
 function onReconnectMove(e: PointerEvent): void {
@@ -226,14 +259,37 @@ function onReconnectMove(e: PointerEvent): void {
   }
 }
 
+/** G1：改写连接同样支持 Esc 取消（capture + stopPropagation，不误伤全局 Esc） */
+function onReconnectEsc(e: KeyboardEvent): void {
+  if (e.key !== 'Escape') return
+  e.stopPropagation()
+  cancelReconnect()
+}
+
+function cancelReconnect(): void {
+  window.removeEventListener('pointermove', onReconnectMove)
+  window.removeEventListener('pointerup', onReconnectUp)
+  window.removeEventListener('keydown', onReconnectEsc, true)
+  reconnect.value = null
+  ui.notify('已取消改写连接')
+}
+
 function onReconnectUp(e: PointerEvent): void {
   const cur = reconnect.value
   window.removeEventListener('pointermove', onReconnectMove)
   window.removeEventListener('pointerup', onReconnectUp)
+  window.removeEventListener('keydown', onReconnectEsc, true)
   reconnect.value = null
   if (!cur) return
   const target = hitNode(e.clientX, e.clientY)
-  if (target) store.reconnectEdge(cur.edgeId, cur.end, target.id)
+  if (!target) return
+  // G9 防自环：落点等于该边另一端节点 ⇒ 本次改写作废（无副作用取消，
+  // 与「拖到空白处松手」的语义一致）
+  const edge = store.edges.find((x) => x.id === cur.edgeId)
+  const otherEndId = edge ? (cur.end === 'source' ? edge.target : edge.source) : null
+  if (otherEndId && target.id === otherEndId) return
+  const handle = pickHandleOnNode(target, svgPoint(e.clientX, e.clientY))
+  store.reconnectEdge(cur.edgeId, cur.end, target.id, handle)
 }
 
 /** 拉线预览曲线 */
@@ -242,6 +298,8 @@ const pendingPath = computed(() => {
   if (!cur) return null
   const node = store.nodes.find((n) => n.id === cur.sourceId)
   if (!node) return null
+  const kind = cur.side === 'left' || cur.side === 'right' ? 'branch' : 'flow'
+  const raw = { x: cur.rawX, y: cur.rawY }
   const ghost: StoryNode = {
     ...node,
     id: '__ghost__',
@@ -250,9 +308,18 @@ const pendingPath = computed(() => {
     w: 24,
     h: 16
   }
-  const kind = cur.side === 'left' || cur.side === 'right' ? 'branch' : 'flow'
-  return buildEdgeGeom(node, ghost, kind, {
-    direction: graph.value?.settings.direction ?? 'vertical'
+  // 已吸附到真实节点时预览落在真实节点的最近边（与松手落库一致）；
+  // 未吸附时用幽灵节点，落点取指针相对幽灵的最近边
+  const snapped = linkSnapTargetId.value
+    ? store.nodes.find((n) => n.id === linkSnapTargetId.value)
+    : null
+  const targetNode = snapped ?? ghost
+  const targetHandle = pickHandleOnNode(targetNode, raw)
+  // 显式传两端 handle：预览线从所按手柄的锚点出发（不再是 kind 猜的锚点）
+  return buildEdgeGeom(node, targetNode, kind, {
+    direction: graph.value?.settings.direction ?? 'vertical',
+    sourceHandle: cur.side,
+    targetHandle
   }).d
 })
 
@@ -265,9 +332,18 @@ const reconnectPath = computed(() => {
   const anchor = store.nodes.find((n) => n.id === anchorId)
   if (!anchor) return null
   const ghost: StoryNode = { ...anchor, id: '__ghost__', x: cur.x - 10, y: cur.y - 8, w: 20, h: 16 }
+  // 拖动端的锚点按指针与幽灵的相对位置实时推算；固定端沿用该边已有 handle
+  // （固定端无 handle 时 buildEdgeGeom 自动回落 kind 规则，与落库后的渲染一致）
+  const movingHandle = pickHandleOnNode(ghost, { x: cur.x, y: cur.y })
   return cur.end === 'source'
-    ? buildEdgeGeom(ghost, anchor, edge.kind).d
-    : buildEdgeGeom(anchor, ghost, edge.kind).d
+    ? buildEdgeGeom(ghost, anchor, edge.kind, {
+        sourceHandle: movingHandle,
+        targetHandle: edge.targetHandle
+      }).d
+    : buildEdgeGeom(anchor, ghost, edge.kind, {
+        sourceHandle: edge.sourceHandle,
+        targetHandle: movingHandle
+      }).d
 })
 
 /* ---------------- 节点事件 ---------------- */
@@ -476,7 +552,7 @@ function onInsertBranch(id: string, dir: 1 | -1): void {
 watch(
   () => store.activeId,
   () => {
-    selectedEdgeId.value = null
+    ui.clearEdgeSelection()
     requestAnimationFrame(() => fitView())
   }
 )
@@ -514,9 +590,9 @@ watch(
         :edges="store.edges"
         :nodes="store.nodes"
         :settings="graph.settings"
-        :selected-id="selectedEdgeId"
+        :selected-id="ui.selectedEdgeId"
         :mode="canvasMode"
-        @select="selectedEdgeId = $event"
+        @select="ui.selectEdge($event)"
         @remove="store.removeEdge($event)"
         @insert-between="store.insertBetween($event)"
         @reconnect-start="onReconnectStart"

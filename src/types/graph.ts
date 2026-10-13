@@ -66,6 +66,13 @@ export interface StoryEdge {
   label?: string
   kind: EdgeKind
   dashed?: boolean
+  /**
+   * 连线起端锚点（四向手柄：上/下/左/右）。
+   * 缺省 = 按 kind 规则自动推断，兼容旧数据（刷新不丢既有边的观感）。
+   */
+  sourceHandle?: PortSide
+  /** 连线末端锚点；缺省语义同 sourceHandle */
+  targetHandle?: PortSide
 }
 
 export interface GraphSettings {

@@ -35,8 +35,38 @@ export function nearestSide(from: StoryNode, to: StoryNode, axis: 'v' | 'h'): Po
   return to.x >= from.x + from.w / 2 ? 'right' : 'left'
 }
 
+/**
+ * 指针 (p) 落在节点四条边中哪一条的最近侧，返回该侧作为锚点。
+ * O(1) 纯函数：四边距离取最小，平局时优先级 top > bottom > left > right
+ * （顺序即比较顺序，严格小于才替换 ⇒ 先者胜）。
+ */
+export function pickHandleOnNode(node: StoryNode, p: Point): PortSide {
+  const dTop = p.y - node.y
+  const dBottom = node.y + node.h - p.y
+  const dLeft = p.x - node.x
+  const dRight = node.x + node.w - p.x
+  let side: PortSide = 'top'
+  let best = dTop
+  if (dBottom < best) {
+    best = dBottom
+    side = 'bottom'
+  }
+  if (dLeft < best) {
+    best = dLeft
+    side = 'left'
+  }
+  if (dRight < best) {
+    side = 'right'
+  }
+  return side
+}
+
 export interface EdgePathOptions {
   direction?: 'vertical' | 'horizontal'
+  /** 起端锚点；与 targetHandle **同时提供**时走显式四向锚点曲线 */
+  sourceHandle?: PortSide
+  /** 末端锚点；任一端缺省 ⇒ 完全走现行 kind 规则（兼容旧数据与旧测试） */
+  targetHandle?: PortSide
 }
 
 export interface EdgePath {
@@ -197,6 +227,37 @@ function horizontalCurve(source: StoryNode, target: StoryNode, kind: EdgeKind): 
   }
 }
 
+/** 端口外法线：显式锚点曲线的控制点沿它偏移，线头才会「探出去」而不是折回来 */
+const PORT_NORMAL: Record<PortSide, Point> = {
+  top: { x: 0, y: -1 },
+  bottom: { x: 0, y: 1 },
+  left: { x: -1, y: 0 },
+  right: { x: 1, y: 0 }
+}
+
+/**
+ * 显式四向锚点曲线：两端锚点由 handle 指定，控制点沿端点外法线偏移。
+ * k = max(两端间距 × 0.5, 48)，守住「控制点偏移 ≥ 间距 40%」的大圆角红线。
+ */
+function explicitCurve(
+  source: StoryNode,
+  target: StoryNode,
+  sourceHandle: PortSide,
+  targetHandle: PortSide
+): Curve {
+  const p0 = getPortPoint(source, sourceHandle)
+  const p1 = getPortPoint(target, targetHandle)
+  const k = Math.max(Math.hypot(p1.x - p0.x, p1.y - p0.y) * 0.5, 48)
+  const ns = PORT_NORMAL[sourceHandle]
+  const nt = PORT_NORMAL[targetHandle]
+  return {
+    p0,
+    c1: { x: p0.x + ns.x * k, y: p0.y + ns.y * k },
+    c2: { x: p1.x + nt.x * k, y: p1.y + nt.y * k },
+    p1
+  }
+}
+
 export function buildEdgePath(
   source: StoryNode,
   target: StoryNode,
@@ -213,9 +274,11 @@ export function buildEdgeGeom(
   opts: EdgePathOptions = {}
 ): EdgePath {
   const curve =
-    opts.direction === 'horizontal'
-      ? horizontalCurve(source, target, kind)
-      : verticalCurve(source, target, kind)
+    opts.sourceHandle && opts.targetHandle
+      ? explicitCurve(source, target, opts.sourceHandle, opts.targetHandle)
+      : opts.direction === 'horizontal'
+        ? horizontalCurve(source, target, kind)
+        : verticalCurve(source, target, kind)
 
   const { p0, c1, c2, p1 } = curve
   const d = `M ${fmt(p0.x)} ${fmt(p0.y)} C ${fmt(c1.x)} ${fmt(c1.y)}, ${fmt(c2.x)} ${fmt(

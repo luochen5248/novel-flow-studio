@@ -6,6 +6,7 @@ import type {
   FlowWorkspace,
   GraphSettings,
   NodeKind,
+  PortSide,
   StoryEdge,
   StoryNode
 } from '@/types/graph'
@@ -15,6 +16,7 @@ import { planCharacterRename, type RenamePlan } from '@/core/characterRename'
 import { history } from '@/core/history'
 import { loadWorkspace, saveWorkspace } from '@/core/storage'
 import { createSampleGraph } from '@/core/sample'
+import { useUiStore } from './useUiStore'
 
 export interface WriteOptions {
   /** true ⇒ 不产生历史记录（拖拽过程中由调用方在起点手动 commit 一次） */
@@ -80,11 +82,51 @@ export const useFlowStore = defineStore('flow', () => {
   /* ---------------- 持久化 ---------------- */
 
   let timer: ReturnType<typeof setTimeout> | null = null
+  /**
+   * 拖拽期持久化暂停标志（性能快赢 2 / G3）。
+   * useNodeDrag 的 start→finish 期间为 true：拖拽每帧的 silent 更新不再触发
+   * 260ms 防抖落盘，finish（onUp / onEsc / cancel 三条退出路径都会到）时补一次。
+   */
+  let dragPersistPaused = false
+
   function persist(): void {
+    if (dragPersistPaused) return
     if (timer) clearTimeout(timer)
     timer = setTimeout(() => {
       saveWorkspace(workspace.value)
     }, PERSIST_DELAY)
+  }
+
+  /** 拖拽开始：暂停持久化（由 useNodeDrag.start 调用） */
+  function pausePersist(): void {
+    dragPersistPaused = true
+  }
+
+  /**
+   * 拖拽结束：恢复持久化并立即落盘一次（由 useNodeDrag 的 cleanup 调用，
+   * onUp / onEsc / cancel 三条退出路径全部经过 cleanup，不会漏）。
+   */
+  function resumePersist(): void {
+    if (!dragPersistPaused) return
+    dragPersistPaused = false
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
+    saveWorkspace(workspace.value)
+  }
+
+  /**
+   * G4：边被删（直接删 / 删节点级联 / 中间插节点替换）后清掉失效的
+   * selectedEdgeId，防止残留选中态让后续 Delete 误触发 removeEdge。
+   * 在 store 动作内清理，快捷键与画布读到的一定是有效 id。
+   */
+  function clearStaleEdgeSelection(): void {
+    const ui = useUiStore()
+    const id = ui.selectedEdgeId
+    if (id && !activeGraph.value?.edges.some((e) => e.id === id)) {
+      ui.clearEdgeSelection()
+    }
   }
 
   watch(
@@ -279,6 +321,7 @@ export const useFlowStore = defineStore('flow', () => {
     g.nodes = g.nodes.filter((n) => n.id !== id)
     g.edges = g.edges.filter((e) => e.source !== id && e.target !== id)
     selectedIds.value = selectedIds.value.filter((x) => x !== id)
+    clearStaleEdgeSelection()
     if (g.settings.layoutMode === 'timeline') layoutTimeline(g)
     touch(g)
     persist()
@@ -379,15 +422,26 @@ export const useFlowStore = defineStore('flow', () => {
   function connectNodes(
     sourceId: string,
     targetId: string,
-    kind: EdgeKind = 'flow'
+    kind: EdgeKind = 'flow',
+    handles?: { sourceHandle?: PortSide; targetHandle?: PortSide }
   ): StoryEdge | null {
     const g = requireGraph()
     if (!g || sourceId === targetId) return null
     const has = g.nodes.some((n) => n.id === sourceId) && g.nodes.some((n) => n.id === targetId)
     if (!has) return null
-    if (g.edges.some((e) => e.source === sourceId && e.target === targetId)) return null
+    // 去重键 = 两端点 + kind + 两端 handle：同两端同 kind 但锚点不同 ⇒ 允许共存
+    // （四向锚点后，「从上连」与「从下连」是两条不同的线，不是重复）
+    const dup = g.edges.some(
+      (e) =>
+        e.source === sourceId &&
+        e.target === targetId &&
+        e.kind === kind &&
+        (e.sourceHandle ?? null) === (handles?.sourceHandle ?? null) &&
+        (e.targetHandle ?? null) === (handles?.targetHandle ?? null)
+    )
+    if (dup) return null
     commit('连接节点')
-    const edge = createEdge(sourceId, targetId, kind)
+    const edge = createEdge(sourceId, targetId, kind, undefined, handles)
     g.edges.push(edge)
     touch(g)
     persist()
@@ -399,6 +453,7 @@ export const useFlowStore = defineStore('flow', () => {
     if (!g) return
     if (!opts.silent) commit('删除连线')
     g.edges = g.edges.filter((e) => e.id !== id)
+    clearStaleEdgeSelection()
     touch(g)
     persist()
   }
@@ -414,14 +469,25 @@ export const useFlowStore = defineStore('flow', () => {
     persist()
   }
 
-  /** 改写连接：把某条边的端点改到另一个节点上 */
-  function reconnectEdge(edgeId: string, end: 'source' | 'target', nodeId: string): void {
+  /**
+   * 改写连接：把某条边的端点改到另一个节点上。
+   * @param handle 落下端的锚点；缺省时清掉该端旧 handle（回落 kind 规则），
+   *   避免旧锚点残留在新节点上
+   */
+  function reconnectEdge(
+    edgeId: string,
+    end: 'source' | 'target',
+    nodeId: string,
+    handle?: PortSide
+  ): void {
     const g = requireGraph()
     if (!g) return
     const edge = g.edges.find((e) => e.id === edgeId)
     if (!edge || !g.nodes.some((n) => n.id === nodeId)) return
     commit('改写连接')
     edge[end] = nodeId
+    if (end === 'source') edge.sourceHandle = handle
+    else edge.targetHandle = handle
     touch(g)
     persist()
   }
@@ -442,9 +508,13 @@ export const useFlowStore = defineStore('flow', () => {
     }
     const node = createNode({ lane, kind: 'event', title: '新的情节' }, a.order + 1)
     g.nodes.push(node)
-    g.edges.push(createEdge(a.id, node.id, edge.kind))
-    g.edges.push(createEdge(node.id, b.id, edge.kind))
+    // G5：外端 handle 继承 —— S→N 继承 E.sourceHandle，N→T 继承 E.targetHandle；
+    // 中间节点 N 的两个内端不设 handle（走 kind 规则）。E 无 handle 时
+    // createEdge 不会写入任何字段，行为与改造前完全一致。
+    g.edges.push(createEdge(a.id, node.id, edge.kind, undefined, { sourceHandle: edge.sourceHandle }))
+    g.edges.push(createEdge(node.id, b.id, edge.kind, undefined, { targetHandle: edge.targetHandle }))
     g.edges = g.edges.filter((e) => e.id !== edgeId)
+    clearStaleEdgeSelection()
     if (g.settings.layoutMode === 'timeline') layoutTimeline(g)
     touch(g)
     selectedIds.value = [node.id]
@@ -626,6 +696,9 @@ export const useFlowStore = defineStore('flow', () => {
     commit,
     undo,
     redo,
-    resetHistory
+    resetHistory,
+    // 拖拽期持久化暂停（G3：useNodeDrag start→finish 期间跳过 persist）
+    pausePersist,
+    resumePersist
   }
 })

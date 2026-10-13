@@ -5,6 +5,7 @@ import {
   type GraphSettings,
   type NodeKind,
   type NodeStatus,
+  type PortSide,
   type StoryEdge,
   type StoryNode
 } from '@/types/graph'
@@ -59,7 +60,8 @@ export function createEdge(
   source: string,
   target: string,
   kind: EdgeKind = 'flow',
-  label?: string
+  label?: string,
+  handles?: { sourceHandle?: PortSide; targetHandle?: PortSide }
 ): StoryEdge {
   const edge: StoryEdge = {
     id: edgeId(),
@@ -69,6 +71,8 @@ export function createEdge(
   }
   if (label !== undefined) edge.label = label
   if (kind === 'flashback') edge.dashed = true
+  if (handles?.sourceHandle) edge.sourceHandle = handles.sourceHandle
+  if (handles?.targetHandle) edge.targetHandle = handles.targetHandle
   return edge
 }
 
@@ -133,6 +137,7 @@ export function reindexLane(graph: FlowGraph, lane: number, orderedIds: string[]
 
 const KIND_SET = new Set<string>(['event', 'scene', 'decision', 'character', 'milestone', 'note'])
 const STATUS_SET = new Set<string>(['planned', 'drafted', 'done'])
+const PORT_SIDE_SET = new Set<string>(['top', 'bottom', 'left', 'right'])
 
 export function sanitizeNode(raw: unknown): StoryNode | null {
   if (!raw || typeof raw !== 'object') return null
@@ -197,6 +202,14 @@ export function sanitizeEdge(raw: unknown, nodeIds: Set<string>): StoryEdge | nu
   const edge: StoryEdge = { id: r.id, source: r.source, target: r.target, kind }
   if (typeof r.label === 'string') edge.label = r.label
   if (typeof r.dashed === 'boolean') edge.dashed = r.dashed
+  // 四向锚点：合法值才进白名单，非法值丢弃（回落 undefined = 按 kind 规则推断）。
+  // 旧数据无此字段 ⇒ undefined，渲染行为与改造前完全一致。
+  if (typeof r.sourceHandle === 'string' && PORT_SIDE_SET.has(r.sourceHandle)) {
+    edge.sourceHandle = r.sourceHandle as PortSide
+  }
+  if (typeof r.targetHandle === 'string' && PORT_SIDE_SET.has(r.targetHandle)) {
+    edge.targetHandle = r.targetHandle as PortSide
+  }
   return edge
 }
 

@@ -362,8 +362,11 @@ function buildEdgeLayer(graph: FlowGraph): SVGGElement {
     if (!source || !target) continue
 
     // 复用 core/geometry：与画布同一套三次贝塞尔（含 flashback 外拱、branch 甩出、jump 大肚子）
+    // handle 缺省的旧边自动回落 kind 规则，导出观感与改造前一致
     const geom = buildEdgeGeom(source, target, edge.kind, {
-      direction: graph.settings.direction
+      direction: graph.settings.direction,
+      sourceHandle: edge.sourceHandle,
+      targetHandle: edge.targetHandle
     })
     const style = EDGE_STYLE[edge.kind] ?? EDGE_STYLE.flow
     const attrs: Record<string, string | number> = {

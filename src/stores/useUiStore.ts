@@ -20,6 +20,8 @@ export const useUiStore = defineStore('ui', () => {
   const storyEditorId = ref<string | null>(null)
   const devConsoleOpen = ref(false)
   const connecting = ref<{ source: string; x: number; y: number } | null>(null)
+  /** 当前选中的连线 id（快捷键删边 / Esc 清选中都要读它，故放 store 而非组件本地态） */
+  const selectedEdgeId = ref<string | null>(null)
 
   const canvasTheme = computed<CanvasMode>(() => {
     const mode = flow.activeGraph?.settings.canvasMode
@@ -87,6 +89,15 @@ export const useUiStore = defineStore('ui', () => {
     devConsoleOpen.value = false
   }
 
+  function selectEdge(id: string): void {
+    selectedEdgeId.value = id
+  }
+
+  /** 清掉连线选中态（点背景 / 切图 / Esc；边被删时由 flow store 调） */
+  function clearEdgeSelection(): void {
+    selectedEdgeId.value = null
+  }
+
   function notify(message: string): void {
     flow.lastMessage = message
   }
@@ -104,6 +115,7 @@ export const useUiStore = defineStore('ui', () => {
     storyEditorId,
     devConsoleOpen,
     connecting,
+    selectedEdgeId,
     toggleTheme,
     setCanvasMode,
     toggleCanvasMode,
@@ -115,6 +127,8 @@ export const useUiStore = defineStore('ui', () => {
     closeStoryEditor,
     toggleDevConsole,
     closeDevConsole,
+    selectEdge,
+    clearEdgeSelection,
     notify
   }
 })

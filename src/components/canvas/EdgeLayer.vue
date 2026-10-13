@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed } from 'vue'
 import type { EdgeKind, GraphSettings, StoryEdge, StoryNode } from '@/types/graph'
 import { buildEdgeGeom } from '@/core/geometry'
 
@@ -21,8 +21,6 @@ const emit = defineEmits<{
   (e: 'reconnect-start', evt: PointerEvent, id: string, end: 'source' | 'target'): void
 }>()
 
-const hoverId = ref<string | null>(null)
-
 const nodeMap = computed(() => new Map(props.nodes.map((n) => [n.id, n])))
 
 interface Rendered {
@@ -40,7 +38,11 @@ const rendered = computed<Rendered[]>(() => {
     const s = nodeMap.value.get(edge.source)
     const t = nodeMap.value.get(edge.target)
     if (!s || !t) continue
-    const geom = buildEdgeGeom(s, t, edge.kind, { direction: props.settings.direction })
+    const geom = buildEdgeGeom(s, t, edge.kind, {
+      direction: props.settings.direction,
+      sourceHandle: edge.sourceHandle,
+      targetHandle: edge.targetHandle
+    })
     out.push({
       edge,
       d: geom.d,
@@ -131,16 +133,7 @@ const MARKER: Record<EdgeKind, string> = {
     <g
       v-for="item in rendered"
       :key="item.edge.id"
-      :class="[
-        'nf-edge',
-        `is-${item.kind}`,
-        {
-          'is-hover': hoverId === item.edge.id,
-          'is-selected': selectedId === item.edge.id
-        }
-      ]"
-      @pointerenter="hoverId = item.edge.id"
-      @pointerleave="hoverId = null"
+      :class="['nf-edge', `is-${item.kind}`, { 'is-selected': selectedId === item.edge.id }]"
     >
       <!-- 加宽的透明命中区，细线也好点 -->
       <path
@@ -167,9 +160,8 @@ const MARKER: Record<EdgeKind, string> = {
         {{ item.edge.label }}
       </text>
 
-      <!-- hover：中点「+」插入中间节点 -->
+      <!-- hover / 选中：中点「+」插入中间节点（显隐由 CSS :hover 驱动） -->
       <g
-        v-if="hoverId === item.edge.id || selectedId === item.edge.id"
         class="nf-edge__plus"
         :transform="`translate(${item.mid.x}, ${item.mid.y})`"
         @pointerdown.stop
@@ -180,9 +172,8 @@ const MARKER: Record<EdgeKind, string> = {
         <path d="M-3.4 0 L3.4 0 M0 -3.4 L0 3.4" class="nf-edge__plus-glyph" />
       </g>
 
-      <!-- 选中：删除 -->
+      <!-- hover / 选中：一步删除（悬停即显，不必先选中） -->
       <g
-        v-if="selectedId === item.edge.id"
         class="nf-edge__del"
         :transform="`translate(${item.mid.x + 24}, ${item.mid.y})`"
         @pointerdown.stop
@@ -193,23 +184,21 @@ const MARKER: Record<EdgeKind, string> = {
         <path d="M-2.8 -2.8 L2.8 2.8 M2.8 -2.8 L-2.8 2.8" class="nf-edge__del-glyph" />
       </g>
 
-      <!-- 选中：端点拖拽改写连接 -->
-      <template v-if="selectedId === item.edge.id">
-        <circle
-          class="nf-edge__endpoint"
-          :cx="item.start.x"
-          :cy="item.start.y"
-          r="6"
-          @pointerdown.stop="emit('reconnect-start', $event, item.edge.id, 'source')"
-        />
-        <circle
-          class="nf-edge__endpoint"
-          :cx="item.end.x"
-          :cy="item.end.y"
-          r="6"
-          @pointerdown.stop="emit('reconnect-start', $event, item.edge.id, 'target')"
-        />
-      </template>
+      <!-- 选中：端点拖拽改写连接（仅选中时可见） -->
+      <circle
+        class="nf-edge__endpoint"
+        :cx="item.start.x"
+        :cy="item.start.y"
+        r="6"
+        @pointerdown.stop="emit('reconnect-start', $event, item.edge.id, 'source')"
+      />
+      <circle
+        class="nf-edge__endpoint"
+        :cx="item.end.x"
+        :cy="item.end.y"
+        r="6"
+        @pointerdown.stop="emit('reconnect-start', $event, item.edge.id, 'target')"
+      />
     </g>
   </g>
 </template>
@@ -244,7 +233,8 @@ const MARKER: Record<EdgeKind, string> = {
   opacity: 0.85;
 }
 
-.nf-edge.is-hover .nf-edge__line {
+/* hover 加粗 / 投影改由 CSS :hover 驱动（不再用 hoverId ref，去掉整层重渲染） */
+.nf-edge:hover .nf-edge__line {
   stroke-width: 3.2;
   filter: drop-shadow(0 2px 6px rgba(15, 23, 32, 0.14));
 }
@@ -270,11 +260,27 @@ const MARKER: Record<EdgeKind, string> = {
   stroke: var(--nf-night);
 }
 
-/* 中点「+」 */
+/* 中点「+」/ 删除「×」/ 端点圆：默认隐藏且不吃事件，hover 或选中时才显形。
+   显隐全部走 CSS（性能快赢 1：hover 不再触发整层重渲染）；
+   nf-fade-in 动画挂在「显形」规则上，每次悬停都会淡入，保持既有动效语义。 */
+.nf-edge__plus,
+.nf-edge__del,
+.nf-edge__endpoint {
+  visibility: hidden;
+  pointer-events: none;
+}
+.nf-edge:hover .nf-edge__plus,
+.nf-edge:hover .nf-edge__del,
+.nf-edge.is-selected .nf-edge__plus,
+.nf-edge.is-selected .nf-edge__del,
+.nf-edge.is-selected .nf-edge__endpoint {
+  visibility: visible;
+  pointer-events: auto;
+  animation: nf-fade-in var(--nf-dur-fast) var(--nf-ease) both;
+}
 .nf-edge__plus,
 .nf-edge__del {
   cursor: pointer;
-  animation: nf-fade-in var(--nf-dur-fast) var(--nf-ease) both;
 }
 .nf-edge__plus-bg,
 .nf-edge__del-bg {
@@ -308,7 +314,6 @@ const MARKER: Record<EdgeKind, string> = {
   stroke: var(--nf-teal);
   stroke-width: 2;
   cursor: crosshair;
-  animation: nf-fade-in var(--nf-dur-fast) var(--nf-ease) both;
 }
 .nf-canvas--dark .nf-edge__endpoint {
   fill: #16232e;

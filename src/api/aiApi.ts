@@ -4,6 +4,7 @@ import type {
   GraphSettings,
   NodeKind,
   NodeStatus,
+  PortSide,
   StoryEdge,
   StoryNode
 } from '@/types/graph'
@@ -125,6 +126,10 @@ export interface AddEdgeInput {
   label?: string
   kind?: EdgeKind
   dashed?: boolean
+  /** 起端锚点：top / bottom / left / right，缺省 = 按 kind 规则自动推断 */
+  sourceHandle?: PortSide
+  /** 末端锚点：同上 */
+  targetHandle?: PortSide
 }
 
 export interface FlowSummary {
@@ -694,16 +699,31 @@ function addEdge(
     if (sourceId === targetId) return fail('addEdge 失败：不能自己连自己')
     if (!findNode(graph, sourceId)) return fail(`addEdge 失败：找不到源节点 ${sourceId}`)
     if (!findNode(graph, targetId)) return fail(`addEdge 失败：找不到目标节点 ${targetId}`)
-    const exists = graph.edges.some((e) => e.source === sourceId && e.target === targetId)
-    if (exists) return fail('addEdge 失败：这两个节点之间已经有连线了')
+    const exists = graph.edges.some(
+      (e) =>
+        e.source === sourceId &&
+        e.target === targetId &&
+        e.kind === (options.kind ?? 'flow') &&
+        (e.sourceHandle ?? null) === (options.sourceHandle ?? null) &&
+        (e.targetHandle ?? null) === (options.targetHandle ?? null)
+    )
+    if (exists) return fail('addEdge 失败：这两个节点之间已经有相同锚点的连线了')
 
-    // store.connectNodes 已经做了重复检测、历史与持久化，优先用
-    const result = callFirstResult(store, ['connectNodes'], [sourceId, targetId, options.kind ?? 'flow'])
+    // store.connectNodes 已经做了重复检测、历史与持久化，优先用（handle 一并透传）
+    const result = callFirstResult(store, ['connectNodes'], [
+      sourceId,
+      targetId,
+      options.kind ?? 'flow',
+      { sourceHandle: options.sourceHandle, targetHandle: options.targetHandle }
+    ])
     let edge: StoryEdge | null = null
     if (result.called && result.value && typeof result.value === 'object') {
       edge = result.value as StoryEdge
     } else {
-      edge = createEdge(sourceId, targetId, options.kind ?? 'flow', options.label)
+      edge = createEdge(sourceId, targetId, options.kind ?? 'flow', options.label, {
+        sourceHandle: options.sourceHandle,
+        targetHandle: options.targetHandle
+      })
       graph.edges.push(edge)
     }
     // store 版本不支持 label，补写一次
@@ -735,7 +755,8 @@ function updateEdge(id: string, patch: Partial<StoryEdge>): ApiResult<StoryEdge>
   return guard((graph, store) => {
     const edge = graph.edges.find((e) => e.id === id)
     if (!edge) return fail(`updateEdge 失败：找不到连线 ${id}`)
-    // id / source / target 不允许被 patch 改写，否则会破坏图的一致性
+    // id / source / target 不允许被 patch 改写，否则会破坏图的一致性；
+    // label / kind / dashed / sourceHandle / targetHandle 均放行（handle 缺省即自动推断）
     const { id: _id, source: _s, target: _t, ...safe } = patch ?? {}
     if (!callFirst(store, ['updateEdge'], [id, safe])) {
       Object.assign(edge, safe)
@@ -1099,9 +1120,9 @@ const HELP_LIST: HelpItem[] = [
   { name: 'renameFlow', signature: 'renameFlow(name)', desc: '重命名当前故事线' },
   { name: 'addNode', signature: 'addNode({title, afterId?, branchOf?, ...})', desc: '新增节点：给 afterId 插到其后并连线；给 branchOf 拉横向分支；都不给则追加到主线末尾' },
   { name: 'addNodes', signature: 'addNodes([...])', desc: '批量新增，按数组顺序自动串联成一条链' },
-  { name: 'addEdge', signature: 'addEdge(sourceId, targetId, {label?, kind?})', desc: '新增连线，kind 可选 flow / branch / flashback / jump' },
+  { name: 'addEdge', signature: 'addEdge(sourceId, targetId, {label?, kind?, sourceHandle?, targetHandle?})', desc: '新增连线，kind 可选 flow / branch / flashback / jump；sourceHandle / targetHandle 可选 top / bottom / left / right，缺省 = 按 kind 规则自动推断' },
   { name: 'removeEdge', signature: 'removeEdge(id)', desc: '删除指定连线' },
-  { name: 'updateEdge', signature: 'updateEdge(id, patch)', desc: '修改连线的 label / kind / dashed（不可改 id 与端点）' },
+  { name: 'updateEdge', signature: 'updateEdge(id, patch)', desc: '修改连线的 label / kind / dashed / sourceHandle / targetHandle（不可改 id 与端点）' },
   { name: 'addNote', signature: 'addNote(nodeId, text)', desc: '追加备注，多次调用换行拼接，不覆盖已有内容' },
   { name: 'addCharacter', signature: 'addCharacter(nodeId, name)', desc: '给节点追加人物（自动去重）' },
   { name: 'addTag', signature: 'addTag(nodeId, tag)', desc: '给节点追加标签（自动去重）' },

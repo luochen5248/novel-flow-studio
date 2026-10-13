@@ -45,10 +45,19 @@ export function useNodeDrag(
   /** 只有真正移动过才压历史，避免「点一下」产生一条空记录 */
   let committed = false
 
+  /**
+   * 摘掉全部窗口监听并复位拖拽态。
+   *
+   * 三条退出路径（onUp→finish(true)、onEsc→finish(false)、cancel()）都经过这里，
+   * 所以「恢复持久化 + 补一次落盘」（G3）放在此处统一管理，任何一条退出都不会漏。
+   */
   function cleanup(): void {
     window.removeEventListener('pointermove', onMove)
     window.removeEventListener('pointerup', onUp)
     window.removeEventListener('keydown', onEsc, true)
+    // 拖拽结束：恢复持久化并立即落盘一次（finish 里的 silent 更新发生在下一行之前，
+    // 仍被暂停覆盖，不会每帧都排一次防抖保存）
+    store.resumePersist()
   }
 
   function onEsc(e: KeyboardEvent): void {
@@ -183,6 +192,8 @@ export function useNodeDrag(
     originY = e.clientY
     draggingId.value = node.id
     committed = false
+    // G3 / 性能快赢 2：拖拽期间暂停持久化，松手 / Esc / cancel 时由 cleanup 补一次落盘
+    store.pausePersist()
 
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)

@@ -1,4 +1,4 @@
-import type { FlowGraph, StoryNode } from '@/types/graph'
+import type { FlowGraph, PortSide, StoryNode } from '@/types/graph'
 import { EDGE_STYLE, TOKEN_COLORS } from './constants'
 import { escapeXml, nodeHex } from './utils'
 
@@ -94,9 +94,25 @@ function nodeStyle(node: StoryNode): string {
   ].join(';') + ';'
 }
 
+/**
+ * 锚点 → draw.io 退出/进入方位（0..1 的相对坐标）。
+ * 缺省（旧边无 handle）保持既有硬编码：出口在下边中点、入口在上边中点。
+ */
+const EXIT_ENTRY: Record<PortSide, { x: number; y: number }> = {
+  top: { x: 0.5, y: 0 },
+  bottom: { x: 0.5, y: 1 },
+  left: { x: 0, y: 0.5 },
+  right: { x: 1, y: 0.5 }
+}
+
 /** 连线样式：正交圆角（drawio 内部会平滑）+ 细长实心箭头 */
-function edgeStyle(kind: keyof typeof EDGE_STYLE): string {
+function edgeStyle(
+  kind: keyof typeof EDGE_STYLE,
+  edge: { sourceHandle?: PortSide; targetHandle?: PortSide }
+): string {
   const s = EDGE_STYLE[kind] ?? EDGE_STYLE.flow
+  const exit = edge.sourceHandle ? EXIT_ENTRY[edge.sourceHandle] : { x: 0.5, y: 1 }
+  const entry = edge.targetHandle ? EXIT_ENTRY[edge.targetHandle] : { x: 0.5, y: 0 }
   const parts = [
     'edgeStyle=orthogonalEdgeStyle',
     'rounded=1',
@@ -104,12 +120,12 @@ function edgeStyle(kind: keyof typeof EDGE_STYLE): string {
     'endArrow=block',
     `strokeWidth=${s.width}`,
     `strokeColor=${s.color}`,
-    'exitX=0.5',
-    'exitY=1',
+    `exitX=${exit.x}`,
+    `exitY=${exit.y}`,
     'exitDx=0',
     'exitDy=0',
-    'entryX=0.5',
-    'entryY=0',
+    `entryX=${entry.x}`,
+    `entryY=${entry.y}`,
     'entryDx=0',
     'entryDy=0'
   ]
@@ -155,7 +171,8 @@ export function toDrawio(graph: FlowGraph, options: DrawioOptions = {}): string 
     const label = edge.label ? ` value="${escapeXml(edge.label)}"` : ''
     body.push(
       `        <mxCell id="edge${edgeIndex}"${label} style="${edgeStyle(
-        edge.kind
+        edge.kind,
+        edge
       )}" edge="1" parent="1" source="${source}" target="${target}">`
     )
     body.push('          <mxGeometry relative="1" as="geometry" />')
