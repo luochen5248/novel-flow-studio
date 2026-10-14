@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import {
   Drawer as ADrawer,
   Input as AInput,
@@ -13,7 +13,12 @@ import type { NodeStatus, StoryNode } from '@/types/graph'
 import { KIND_LABEL, NODE_STATUSES, STATUS_LABEL } from '@/types/graph'
 import { useFlowStore } from '@/stores/useFlowStore'
 import { useUiStore } from '@/stores/useUiStore'
+import { useAiStore } from '@/stores/useAiStore'
 import TagInput from '@/components/common/TagInput.vue'
+import AiContextMenu from '@/components/common/AiContextMenu.vue'
+import AiAssistDialog from '@/components/ai/AiAssistDialog.vue'
+import type { AssistMode } from '@/core/aiPrompt'
+import { pickNeighbors } from '@/core/aiPrompt'
 
 /**
  * StoryEditorDrawer —— 右侧滑出式正文编辑抽屉（宽 640px）
@@ -22,10 +27,14 @@ import TagInput from '@/components/common/TagInput.vue'
  * 正文变更 debounce 600ms 写入 store（避免每字压一条历史）。
  * 顶部可编辑标题 / 类型徽标 / 状态切换；侧栏快编 timeLabel / location / characters；
  * 底部按 lane+order 顺序在上一个 / 下一个节点间切换。
+ *
+ * 右键 AI：正文里右键 → 查资料 / 续写 / 润色，结果**流式直接写在光标处**，
+ * 期间不落库（避免逐 chunk 压历史），流结束再落一次（见下方 AI 写入段落）。
  */
 
 const store = useFlowStore()
 const ui = useUiStore()
+const ai = useAiStore()
 
 const node = computed<StoryNode | null>(
   () => store.nodes.find((n) => n.id === ui.storyEditorId) ?? null
@@ -42,10 +51,14 @@ const index = computed(() => sequence.value.findIndex((n) => n.id === node.value
 
 const content = ref('')
 const titleDraft = ref('')
+/** 声明必须早于下方 immediate watch：watch 同步首跑时就会读它（TDZ 防护，m1） */
+const assistDialog = ref<InstanceType<typeof AiAssistDialog> | null>(null)
 
 watch(
   node,
   (next) => {
+    // 切篇时先把流式任务结算到上一篇，否则 AI 会继续往新正文里写
+    if (ai.streaming) assistDialog.value?.close()
     if (next) {
       content.value = next.content
       titleDraft.value = next.title
@@ -73,6 +86,82 @@ function flushContent(): void {
 }
 const charCount = computed(() => content.value.length)
 
+/** 把当前 content 立刻写成一条历史记录，并吃掉在飞的 600ms 定时器 */
+function commitNow(): void {
+  contentTargetId = node.value?.id
+  flushContent()
+}
+
+/* ---------------- 右键 AI（流式写入光标处） ---------------- */
+const menuOpen = ref(false)
+const menuX = ref(0)
+const menuY = ref(0)
+const selection = ref<{ start: number; end: number }>({ start: 0, end: 0 })
+/** 触发右键的原生 textarea：流式期间靠它恢复光标 */
+const streamEl = ref<HTMLTextAreaElement | null>(null)
+/** 右键那一刻的节点 id：结算时以它为准 */
+let streamTargetId = ''
+
+function onContentContextMenu(e: Event): void {
+  const target = e.target as HTMLTextAreaElement | null
+  if (!target || typeof target.selectionStart !== 'number') return
+  const mouse = e as MouseEvent
+  streamEl.value = target
+  selection.value = { start: target.selectionStart, end: target.selectionEnd }
+  menuX.value = mouse.clientX
+  menuY.value = mouse.clientY
+  menuOpen.value = true
+}
+
+/** AI 每来一段就整段重写本地值（不落库），并把光标顶到新文本末尾 */
+function writeStream(value: string, caretPos: number): void {
+  content.value = value
+  void nextTick(() => {
+    const el = streamEl.value
+    if (el) el.setSelectionRange(caretPos, caretPos)
+  })
+}
+
+function settleStream(): void {
+  // 锁到右键那一刻的节点：中途换过节点也不会写错地方
+  contentTargetId = streamTargetId || node.value?.id
+  flushContent()
+  streamTargetId = ''
+  void nextTick(() => {
+    const el = streamEl.value
+    const pos = Math.min(content.value.length, el?.selectionStart ?? content.value.length)
+    if (el) el.setSelectionRange(pos, pos)
+  })
+}
+
+function onAssist(mode: AssistMode): void {
+  const target = node.value
+  if (!target) return
+  // 先把用户刚打的字落库，避免在飞的 600ms 定时器与 AI 写入互相覆盖
+  commitNow()
+  streamTargetId = target.id
+  assistDialog.value?.open({
+    mode,
+    node: {
+      title: target.title,
+      summary: target.summary,
+      content: content.value,
+      characters: target.characters,
+      location: target.location,
+      timeLabel: target.timeLabel,
+      chapter: target.chapter,
+      kind: target.kind
+    },
+    neighbors: pickNeighbors(store.nodes, target.id),
+    baseText: content.value,
+    selection: { ...selection.value },
+    x: menuX.value,
+    y: menuY.value,
+    onUpdate: writeStream,
+    onSettled: settleStream
+  })
+}
+
 /* ---------------- 顶部字段 ---------------- */
 function onTitleChange(e: Event): void {
   const value = (e.target as HTMLInputElement).value
@@ -96,6 +185,8 @@ function setCharacters(value: string[]): void {
 
 /* ---------------- 上 / 下篇切换 ---------------- */
 function goto(targetId: string): void {
+  // 正在流式写入时必须先结算：否则换节点后 AI 会继续往新节点的正文里写字
+  assistDialog.value?.close()
   flushContent()
   ui.openStoryEditor(targetId)
   store.select([targetId])
@@ -110,6 +201,7 @@ function next(): void {
 }
 
 function close(): void {
+  assistDialog.value?.close()
   flushContent()
   ui.closeStoryEditor()
 }
@@ -152,6 +244,7 @@ function close(): void {
           placeholder="在这里写下这一段故事……"
           :auto-size="{ minRows: 18, maxRows: 30 }"
           @input="onContentInput"
+          @contextmenu.prevent="onContentContextMenu"
         />
         <div class="nf-story__count">{{ charCount.toLocaleString() }} 字</div>
       </div>
@@ -169,7 +262,10 @@ function close(): void {
           <label class="nf-story__side-label">人物</label>
           <TagInput :model-value="node.characters" placeholder="回车增删" @update:model-value="setCharacters" />
         </div>
-        <p class="nf-story__side-hint">正文每停顿 0.6 秒自动保存一次。</p>
+        <p class="nf-story__side-hint">
+          正文每停顿 0.6 秒自动保存一次。<br />
+          正文里<b>右键</b>可以唤 AI 查资料 / 续写 / 润色。
+        </p>
       </aside>
     </div>
 
@@ -199,6 +295,18 @@ function close(): void {
       </div>
     </template>
   </ADrawer>
+
+  <!-- 浮层挂在抽屉之外：抽屉关闭 / 切换上下篇时由 close() 统一结算流式状态 -->
+  <AiContextMenu
+    :open="menuOpen"
+    :x="menuX"
+    :y="menuY"
+    :has-selection="selection.end > selection.start"
+    :busy="ai.streaming"
+    @select="onAssist"
+    @close="menuOpen = false"
+  />
+  <AiAssistDialog ref="assistDialog" />
 </template>
 
 <style scoped>

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import {
   Tabs as ATabs,
   TabPane as ATabPane,
@@ -24,7 +24,12 @@ import {
 } from '@/types/graph'
 import { useFlowStore } from '@/stores/useFlowStore'
 import { useUiStore } from '@/stores/useUiStore'
+import { useAiStore } from '@/stores/useAiStore'
 import TagInput from '@/components/common/TagInput.vue'
+import AiContextMenu from '@/components/common/AiContextMenu.vue'
+import AiAssistDialog from '@/components/ai/AiAssistDialog.vue'
+import type { AssistMode } from '@/core/aiPrompt'
+import { pickNeighbors } from '@/core/aiPrompt'
 
 /**
  * NodeInspector —— 右侧属性检查器（宽 320px，可折叠）
@@ -38,11 +43,14 @@ const emit = defineEmits<{ (e: 'open-ai-image'): void }>()
 
 const store = useFlowStore()
 const ui = useUiStore()
+const ai = useAiStore()
 
 const node = computed<StoryNode | null>(() => store.currentNode)
 
 /* 选中节点即展开检查器；首屏无选中时也让总览态可见 */
 watch(node, (next) => {
+  // 切节点时先把流式任务结算到旧节点上，避免 AI 接着往新节点里写
+  if (ai.streaming) assistDialog.value?.close()
   if (next) ui.inspectorOpen = true
 })
 onMounted(() => {
@@ -77,6 +85,112 @@ function textUpdate(patch: Partial<StoryNode>): void {
 function onText(field: keyof StoryNode, e: Event): void {
   const target = e.target as HTMLInputElement | HTMLTextAreaElement
   textUpdate({ [field]: target.value } as Partial<StoryNode>)
+}
+
+/* ---------------- 右键 AI（流式写入光标处） ----------------
+ * 这里的两个多行文本框是「受控 + 300ms 防抖」的（上面 textUpdate），
+ * 因此任何 AI 写入前都必须先 clearTimeout(textTimer)：
+ * 否则那个在飞的定时器会把 IME 输入期的旧 target.value 写回 store，把 AI 结果盖掉（调查 E13）。
+ * 流式期间不落库，先用 streamValue 顶替显示，流结束再一次性写 store。
+ */
+type AssistField = 'summary' | 'note'
+
+const menuOpen = ref(false)
+const menuX = ref(0)
+const menuY = ref(0)
+const selection = ref<{ start: number; end: number }>({ start: 0, end: 0 })
+const streamEl = ref<HTMLTextAreaElement | null>(null)
+/** 当前正在被 AI 写入的字段；null 表示没有流式任务 */
+const streamField = ref<AssistField | null>(null)
+/** 流式期间的显示值（盖住 store 里的旧值，避免每个 chunk 压一条历史） */
+const streamValue = ref<string | null>(null)
+const assistDialog = ref<InstanceType<typeof AiAssistDialog> | null>(null)
+
+let menuField: AssistField = 'summary'
+let menuBaseText = ''
+/** 右键那一刻的节点 id：流结束写库时以它为准，防止中途切节点把内容写错地方 */
+let menuNodeId = ''
+
+/** textarea 的当前显示值：流式期间优先用流式值 */
+function fieldValue(field: AssistField): string {
+  if (!node.value) return ''
+  if (streamField.value === field && streamValue.value !== null) return streamValue.value
+  return (node.value[field] as string | undefined) ?? ''
+}
+
+/** 吃掉在飞的防抖定时器：AI 写入 store 之前的必经一步 */
+function cancelPendingText(): void {
+  if (textTimer) {
+    clearTimeout(textTimer)
+    textTimer = undefined
+  }
+}
+
+function onTextContextMenu(field: AssistField, e: Event): void {
+  const target = e.target as HTMLTextAreaElement | null
+  if (!target || typeof target.selectionStart !== 'number') return
+  const mouse = e as MouseEvent
+  menuField = field
+  menuBaseText = target.value
+  menuNodeId = node.value?.id ?? ''
+  streamEl.value = target
+  selection.value = { start: target.selectionStart, end: target.selectionEnd }
+  menuX.value = mouse.clientX
+  menuY.value = mouse.clientY
+  menuOpen.value = true
+}
+
+function writeStream(value: string, caretPos: number): void {
+  cancelPendingText()
+  streamField.value = menuField
+  streamValue.value = value
+  void nextTick(() => streamEl.value?.setSelectionRange(caretPos, caretPos))
+}
+
+function settleStream(payload: { value: string; caretPos: number }): void {
+  cancelPendingText()
+  streamField.value = null
+  streamValue.value = null
+  const targetId = menuNodeId || node.value?.id
+  if (targetId && store.nodes.some((n) => n.id === targetId)) {
+    store.updateNode(targetId, { [menuField]: payload.value } as Partial<StoryNode>)
+  }
+  void nextTick(() => {
+    const el = streamEl.value
+    const pos = Math.min(payload.value.length, payload.caretPos)
+    if (el) el.setSelectionRange(pos, pos)
+  })
+}
+
+function onAssist(mode: AssistMode): void {
+  const current = node.value
+  if (!current) return
+  // 先把用户刚打的字结算掉：否则那个定时器会在 AI 写入后把旧内容盖回来。
+  // 这里不用「取消」而用「立即写」—— 万一 AI 起不来，用户已经打的字也不会丢。
+  cancelPendingText()
+  if (menuBaseText !== ((current[menuField] as string | undefined) ?? '')) {
+    store.updateNode(current.id, { [menuField]: menuBaseText } as Partial<StoryNode>)
+  }
+  assistDialog.value?.open({
+    mode,
+    node: {
+      title: current.title,
+      summary: current.summary,
+      content: current.content,
+      characters: current.characters,
+      location: current.location,
+      timeLabel: current.timeLabel,
+      chapter: current.chapter,
+      kind: current.kind
+    },
+    neighbors: pickNeighbors(store.nodes, current.id),
+    baseText: menuBaseText,
+    selection: { ...selection.value },
+    x: menuX.value,
+    y: menuY.value,
+    onUpdate: writeStream,
+    onSettled: settleStream
+  })
 }
 
 const kindOptions = NODE_KINDS.map((k) => ({ value: k, label: KIND_LABEL[k] }))
@@ -271,21 +385,23 @@ function addFirst(): void {
           <!-- 内容 -->
           <ATabPane key="content" tab="内容">
             <div class="nf-field">
-              <label class="nf-field__label">摘要<span class="nf-field__tip">卡片上展示，限 2 行</span></label>
+              <label class="nf-field__label">摘要<span class="nf-field__tip">卡片上展示，限 2 行 · 右键可唤 AI</span></label>
               <ATextarea
-                :value="node.summary"
+                :value="fieldValue('summary')"
                 :auto-size="{ minRows: 2, maxRows: 4 }"
                 placeholder="一句话讲清这个节点发生了什么"
                 @change="onText('summary', $event)"
+                @contextmenu.prevent="onTextContextMenu('summary', $event)"
               />
             </div>
             <div class="nf-field">
-              <label class="nf-field__label">备注<span class="nf-field__tip">AI 可写，作者补充</span></label>
+              <label class="nf-field__label">备注<span class="nf-field__tip">AI 可写，作者补充 · 右键可唤 AI</span></label>
               <ATextarea
-                :value="node.note"
+                :value="fieldValue('note')"
                 :auto-size="{ minRows: 2, maxRows: 4 }"
                 placeholder="伏笔、素材、写作提示…"
                 @change="onText('note', $event)"
+                @contextmenu.prevent="onTextContextMenu('note', $event)"
               />
             </div>
             <AButton block class="nf-inspector__write" @click="openStory">
@@ -373,6 +489,18 @@ function addFirst(): void {
       </div>
     </div>
   </aside>
+
+  <!-- 浮层由 Teleport 挂到 body，不影响检查器自身的布局流 -->
+  <AiContextMenu
+    :open="menuOpen"
+    :x="menuX"
+    :y="menuY"
+    :has-selection="selection.end > selection.start"
+    :busy="ai.streaming"
+    @select="onAssist"
+    @close="menuOpen = false"
+  />
+  <AiAssistDialog ref="assistDialog" />
 </template>
 
 <style scoped>

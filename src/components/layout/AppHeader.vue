@@ -5,6 +5,7 @@ import { useUiStore } from '@/stores/useUiStore'
 import ExportMenu from '@/components/toolbar/ExportMenu.vue'
 import UpdateDialog from '@/components/common/UpdateDialog.vue'
 import GrsaiKeyDialog from '@/components/common/GrsaiKeyDialog.vue'
+import AiModelDialog from '@/components/common/AiModelDialog.vue'
 
 const store = useFlowStore()
 const ui = useUiStore()
@@ -13,6 +14,8 @@ const ui = useUiStore()
 const isDesktop = !!(window as unknown as { electronAPI?: unknown }).electronAPI
 const updateDialog = ref<InstanceType<typeof UpdateDialog> | null>(null)
 const keyDialog = ref<InstanceType<typeof GrsaiKeyDialog> | null>(null)
+/** AI 模型管理：统一的 LLM + 生图入口（含内置 grsai） */
+const modelDialog = ref<InstanceType<typeof AiModelDialog> | null>(null)
 
 const editing = ref(false)
 const draft = ref('')
@@ -116,6 +119,27 @@ const doneCount = computed(() => store.nodes.filter((n) => n.status === 'done').
       </button>
 
       <button
+        v-if="isDesktop"
+        class="nf-header__icon"
+        title="AI 模型管理（文本 / 生图，密钥只存在本机）"
+        @click="modelDialog?.open()"
+      >
+        <svg viewBox="0 0 16 16" width="16" height="16">
+          <circle cx="8" cy="8" r="2.1" fill="none" stroke="currentColor" stroke-width="1.3" />
+          <circle cx="3.4" cy="4.2" r="1.5" fill="none" stroke="currentColor" stroke-width="1.2" />
+          <circle cx="12.6" cy="4.2" r="1.5" fill="none" stroke="currentColor" stroke-width="1.2" />
+          <circle cx="4.6" cy="12.4" r="1.5" fill="none" stroke="currentColor" stroke-width="1.2" />
+          <path
+            d="M4.7 5.1 L6.4 6.7 M11.3 5.1 L9.6 6.7 M5.5 11.3 L6.8 9.6"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.2"
+            stroke-linecap="round"
+          />
+        </svg>
+      </button>
+
+      <button
         class="nf-header__icon"
         :class="{ 'is-on': ui.devConsoleOpen }"
         title="开发者 / AI 控制台（window.NovelFlow 全部方法）"
@@ -154,6 +178,7 @@ const doneCount = computed(() => store.nodes.filter((n) => n.status === 'done').
 
     <UpdateDialog ref="updateDialog" />
     <GrsaiKeyDialog ref="keyDialog" />
+    <AiModelDialog ref="modelDialog" />
   </header>
 </template>
 

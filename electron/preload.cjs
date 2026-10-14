@@ -4,6 +4,8 @@
  * 通过 contextBridge 向渲染进程暴露最小安全面：
  *  - 更新相关：检查 / 下载 / 安装 / 状态订阅 / 当前版本
  *  - 密钥相关：读写 grsai 密钥（存 userData/config.json，不进 git、不进 exe）
+ *  - AI 相关：模型增删改查 / 测连 / 对话（含流式与取消）/ 生图；
+ *    密钥与真实端点都留在主进程，这里只透传方法调用。
  * 其余 Node 能力一律不暴露。
  */
 const { contextBridge, ipcRenderer } = require('electron')
@@ -29,5 +31,27 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('update:status', listener)
     return () => ipcRenderer.removeListener('update:status', listener)
+  },
+
+  /* ---- AI 模型（密钥全程留在主进程，渲染层只拿到脱敏视图） ---- */
+  ai: {
+    /** 脱敏模型列表 + 当前激活项 */
+    listModels: () => ipcRenderer.invoke('ai:list-models'),
+    saveModel: (cfg) => ipcRenderer.invoke('ai:save-model', cfg),
+    removeModel: (id) => ipcRenderer.invoke('ai:remove-model', id),
+    setActive: (patch) => ipcRenderer.invoke('ai:set-active', patch),
+    /** 主进程代发最小请求；返回里不含任何密钥信息 */
+    testModel: (cfg) => ipcRenderer.invoke('ai:test-model', cfg),
+    chat: (req) => ipcRenderer.invoke('ai:chat', req),
+    /** 立即拿到 requestId，正文走 onAiChunk 增量推送 */
+    chatStream: (req) => ipcRenderer.invoke('ai:chat-stream', req),
+    cancelChat: (requestId) => ipcRenderer.invoke('ai:cancel-chat', requestId),
+    image: (req) => ipcRenderer.invoke('ai:image', req),
+    /** 订阅流式增量：{ requestId, delta?, done?, error? }；返回取消订阅函数 */
+    onAiChunk: (callback) => {
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on('ai:chunk', listener)
+      return () => ipcRenderer.removeListener('ai:chunk', listener)
+    }
   }
 })
