@@ -9,6 +9,10 @@ import './styles/polish.css'
 // 副作用导入：挂载 window.NovelFlow（AI / 控制台可编程 API），不修改 aiApi.ts 本身
 import './api/aiApi'
 
+// 副作用导入：MCP 渲染层调用桥（外部 AI 经控制服务器调 window.NovelFlow；
+// 浏览器 / 无 Electron 环境静默跳过）
+import './mcp/rendererBridge'
+
 const app = createApp(App)
 app.use(createPinia())
 app.use(Antd)

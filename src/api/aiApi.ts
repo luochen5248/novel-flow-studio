@@ -12,6 +12,10 @@ import { createEdge, createGraph, createNode, deepClone, findNode } from '@/core
 import { layoutTimeline } from '@/core/layout'
 // 人物名匹配复用 core 的唯一口径（大小写敏感、容忍前后空白），避免 aiApi 里再长出第二份实现
 import { sameCharacterName } from '@/core/characterRename'
+// 人物卡片落位复用 core 的纯函数，与工具栏「新建人物卡」共用同一套网格规则
+import { nextCharacterSlot } from '@/core/characterSlot'
+// 人物卡片的保留道 / 专用尺寸复用工具栏入口那两个常量，不另造魔数
+import { CHARACTER_LANE, CHARACTER_NODE_W } from '@/components/canvas/characterCard'
 import {
   downloadBlob,
   exportFilenameFor,
@@ -586,13 +590,38 @@ function addNode(input: AddNodeInput): ApiResult<StoryNode> {
       }
     }
 
+    // 【人物卡 · 完全取消自动连边与让位（用户决策）】
+    // afterId / branchOf 都是主线语义：连一条边 + 同 lane 内 order 位移。套在人物卡上
+    // 会把角色牌接进主线 flow 链（toMarkdown 的 outlineOrder / toMermaid 的 lane 分桶 /
+    // aiPrompt 的 pickNeighbors 都按 lane 分组，导出时会露馅），且 order 位移白改一圈。
+    // 处置：显式传入即报错（程序化调用方要明确反馈，不是静默忽略）；
+    // 报错点早于下面任何状态变更（order 位移 / 建节点 / 连边都在其后）⇒ 失败零副作用。
+    // 重名拦截在上面先行 —— 两者同时命中时优先报 name clash（更具体、可操作）。
+    if (kind === 'character') {
+      if (input.afterId) {
+        return fail(
+          `addNode 失败：人物卡片不支持 afterId「${input.afterId}」—— 人物卡不参与连线与时间线让位，请去掉 afterId（或改用普通 kind）`
+        )
+      }
+      if (input.branchOf) {
+        return fail(
+          `addNode 失败：人物卡片不支持 branchOf「${input.branchOf}」—— 人物卡不参与连线与时间线让位，请去掉 branchOf（或改用普通 kind）`
+        )
+      }
+    }
+
     let lane = 0
     let order = 0
     let connectFrom: string | null = null
     let edgeKind: EdgeKind = 'flow'
     let successorEdge: StoryEdge | null = null
 
-    if (input.afterId) {
+    if (kind === 'character') {
+      // 人物卡专用落点：保留道（调用方显式传 lane 时尊重调用方）+ 道内自增 order。
+      // connectFrom / successorEdge 恒为 null ⇒ 不连任何边、不改接任何既有边。
+      lane = typeof input.lane === 'number' ? input.lane : CHARACTER_LANE
+      order = nextOrderIn(graph, lane)
+    } else if (input.afterId) {
       const anchor = findNode(graph, input.afterId)
       if (!anchor) return fail(`addNode 失败：找不到 afterId 对应的节点「${input.afterId}」`)
       lane = typeof input.lane === 'number' ? input.lane : anchor.lane
@@ -650,6 +679,27 @@ function addNode(input: AddNodeInput): ApiResult<StoryNode> {
         status: input.status ?? 'planned',
         lane,
         order,
+        // 【人物卡 · 与工具栏入口对齐的三件套】character 必须走 CHARACTER_LANE 保留道、
+        // 用 CHARACTER_NODE_W 专用尺寸、并用 nextCharacterSlot 错位落位。
+        //   - lane：不补的话 character 会落到 lane 0，而 `toMarkdown` 的 outlineOrder、
+        //     `toMermaid` 的 lane 分桶、`aiPrompt` 的 pickNeighbors 都按 lane 分组 ——
+        //     人物卡会被当成主线剧情节点排进主线。画布上看不出来（character 布局豁免），
+        //     但导出会露馅，正是用户要摆脱的那种「被时间线管控」。
+        //     调用方显式传 lane 时尊重调用方，只有缺省才用保留道。
+        //     （lane 已在上面人物卡分支算好：显式数字尊重调用方，非数字（含脏类型
+        //     如 '7'）收敛为保留道；此处直接用该变量，保持单点真相——
+        //     不再出现 spread 透传脏 lane、reload 后被 sanitizeNode 打回主线的事故。）
+        //   - w：与工具栏建出来的人物卡同宽（196），不补则是 268 的普通卡宽度。
+        //   - x / y：character 被 `isLayoutExempt` 永久剔出布局集合，
+        //     `layoutTimeline` 不会再给它排位，留给 createNode 兜底 (0,0) 就会叠成一坨。
+        // order 与连边同样已在上面人物卡分支处理（道内自增、不连边），此处不重复。
+        ...(kind === 'character'
+          ? {
+              lane,
+              w: CHARACTER_NODE_W,
+              ...nextCharacterSlot(graph.nodes)
+            }
+          : {}),
         ...(input.note ? { note: input.note } : {}),
         ...(input.color ? { color: input.color } : {})
       },
@@ -670,6 +720,12 @@ function addNode(input: AddNodeInput): ApiResult<StoryNode> {
 /**
  * 批量添加：首项按自身规则落位，之后每一项接在前一项之后并自动连线。
  * 任一项失败即停止（已创建的节点保留，便于排查）。
+ *
+ * ⚠️ 人物卡（`kind === 'character'`）**不参与批量链**：
+ *   - 不给它注入 afterId（调用方显式传的透传，由 addNode 的守卫报错）；
+ *   - 它也不充当后续项的 previousId。
+ * 否则混合批量（如 `[character, event]`）会把事件继承到人物道（lane 100）并接到
+ * 角色牌上 —— 主线剧情整体变形，且连坐影响后面全部项。
  */
 function addNodes(list: AddNodeInput[]): ApiResult<StoryNode[]> {
   if (!Array.isArray(list)) return fail('addNodes 失败：参数必须是数组')
@@ -677,14 +733,16 @@ function addNodes(list: AddNodeInput[]): ApiResult<StoryNode[]> {
   const created: StoryNode[] = []
   let previousId: string | null = null
   for (const [i, raw] of list.entries()) {
+    const isCharacter = (raw.kind ?? 'event') === 'character'
     const input: AddNodeInput =
-      i === 0 ? raw : { ...raw, afterId: raw.afterId ?? previousId ?? undefined }
+      i === 0 || isCharacter ? raw : { ...raw, afterId: raw.afterId ?? previousId ?? undefined }
     const result = addNode(input)
     if (!result.ok || !result.data) {
       return fail(`addNodes 第 ${i + 1} 项失败：${result.error ?? '未知错误'}`)
     }
     created.push(result.data)
-    previousId = result.data.id
+    // 人物卡不当链头：后续项的 afterId 不能指向它（见函数头 ⚠️ 段）
+    if (result.data.kind !== 'character') previousId = result.data.id
   }
   return ok(created)
 }
@@ -1118,8 +1176,8 @@ const HELP_LIST: HelpItem[] = [
   { name: 'openFlow', signature: 'openFlow(idOrName)', desc: '按 id 或名称打开某条故事线' },
   { name: 'removeFlow', signature: 'removeFlow(id)', desc: '删除指定的故事线' },
   { name: 'renameFlow', signature: 'renameFlow(name)', desc: '重命名当前故事线' },
-  { name: 'addNode', signature: 'addNode({title, afterId?, branchOf?, ...})', desc: '新增节点：给 afterId 插到其后并连线；给 branchOf 拉横向分支；都不给则追加到主线末尾' },
-  { name: 'addNodes', signature: 'addNodes([...])', desc: '批量新增，按数组顺序自动串联成一条链' },
+  { name: 'addNode', signature: 'addNode({title, afterId?, branchOf?, ...})', desc: '新增节点：给 afterId 插到其后并连线；给 branchOf 拉横向分支；都不给则追加到主线末尾。例外：kind:"character" 不走时间线——不支持 afterId/branchOf（传了会报错），自动落人物保留道且不连边；显式传 lane 的人物卡会按该 lane 参与导出分组（可能进主线桶），不传 lane 才进保留道' },
+  { name: 'addNodes', signature: 'addNodes([...])', desc: '批量新增，按数组顺序自动串联成一条链；人物卡（kind:"character"）不参与链：不串联、不连边、不带偏后续项' },
   { name: 'addEdge', signature: 'addEdge(sourceId, targetId, {label?, kind?, sourceHandle?, targetHandle?})', desc: '新增连线，kind 可选 flow / branch / flashback / jump；sourceHandle / targetHandle 可选 top / bottom / left / right，缺省 = 按 kind 规则自动推断' },
   { name: 'removeEdge', signature: 'removeEdge(id)', desc: '删除指定连线' },
   { name: 'updateEdge', signature: 'updateEdge(id, patch)', desc: '修改连线的 label / kind / dashed / sourceHandle / targetHandle（不可改 id 与端点）' },

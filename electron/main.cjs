@@ -24,9 +24,14 @@ const GRSAI_TARGET = 'https://grsai.dakka.com.cn'
 const GRSAI_PREFIX = '/api/grsai'
 
 /* ------------------------------------------------------------------ */
-/* 单实例锁：避免更新安装 / 重复启动时出现多窗口                                        */
+/* 启动模式：--mcp = 无窗口 MCP 桥接实例（必须在单例锁之前判断）                        */
 /* ------------------------------------------------------------------ */
-if (!app.requestSingleInstanceLock()) {
+const MCP_MODE = process.argv.includes('--mcp')
+
+if (MCP_MODE) {
+  // MCP 客户端每次连接都会 spawn 一个新进程：若照抢单例锁，GUI 已在运行时会
+  // 把桥接实例自己挡退。桥接无窗口、不碰业务数据，与 GUI 实例必须能共存。
+} else if (!app.requestSingleInstanceLock()) {
   app.quit()
 }
 
@@ -1050,6 +1055,118 @@ ipcMain.handle('ai:image', async (_event, req) => {
 })
 
 /* ------------------------------------------------------------------ */
+/* MCP：stdio 桥接实例（--mcp）与 GUI 实例的本地控制服务器                            */
+/* ------------------------------------------------------------------ */
+
+/** 唤醒用的默认 spawn：打包态直接跑 exe；开发态带上 main.cjs 与 --dev */
+function defaultSpawnGui() {
+  const args = app.isPackaged
+    ? []
+    : [path.join(app.getAppPath(), 'electron', 'main.cjs'), '--dev']
+  const child = require('node:child_process').spawn(process.execPath, args, {
+    detached: true,
+    stdio: 'ignore'
+  })
+  child.unref()
+}
+
+/**
+ * --mcp 模式入口。stdout 只允许出现 JSON-RPC 帧（MCP 协议生死线），
+ * 因此本模式下 console.log/info/warn/debug 全部改道 stderr。
+ */
+function startMcpStdioServer() {
+  const toStderr = (...args) => process.stderr.write(args.map((a) => String(a)).join(' ') + '\n')
+  for (const level of ['log', 'info', 'warn', 'debug']) {
+    console[level] = toStderr
+  }
+
+  const { createControlClient } = require('./mcp/control-client.cjs')
+  const { createWaker } = require('./mcp/wake.cjs')
+  const { createMcpServer } = require('./mcp/server.cjs')
+
+  const logger = { log: toStderr, error: toStderr }
+  const client = createControlClient({ userDataDir: app.getPath('userData'), logger })
+  const waker = createWaker({ client, spawnGui: defaultSpawnGui, logger })
+  const server = createMcpServer({
+    stdin: process.stdin,
+    stdout: process.stdout,
+    client,
+    waker,
+    logger,
+    version: app.getVersion()
+  })
+  server.start()
+
+  // MCP 客户端断开管道（关会话 / 杀进程）→ 桥接实例退场，GUI 实例不受影响
+  const bye = () => app.exit(0)
+  process.stdin.on('end', bye)
+  process.stdin.on('close', bye)
+  process.stdin.on('error', bye)
+}
+
+/* ---- GUI 实例：本地控制服务器（MCP 数据通路） ---- */
+
+let controlServer = null
+/** callId → { resolve, timer }：渲染层回包的中转表 */
+const mcpPending = new Map()
+
+function startControlServer() {
+  const { createControlServer } = require('./control-server.cjs')
+  controlServer = createControlServer({
+    userDataDir: app.getPath('userData'),
+    version: app.getVersion(),
+    invoke: (method, params) => invokeRenderer(method, params),
+    focus: focusMainWindow,
+    logger: console
+  })
+  controlServer.start().catch((err) => console.error('[mcp] 控制服务器启动失败', err))
+}
+
+function stopControlServer() {
+  if (!controlServer) return
+  try {
+    controlServer.stop()
+  } catch {
+    /* 退出路径容错 */
+  }
+  controlServer = null
+}
+
+function focusMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+/** 控制服务器 → 渲染层：发 mcp:invoke，等 mcp:result 回包（30s 超时） */
+function invokeRenderer(method, params) {
+  return new Promise((resolve) => {
+    const wc = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null
+    if (!wc || wc.isLoading()) {
+      resolve({ ok: false, error: '主程序界面尚未就绪，请稍候重试' })
+      return
+    }
+    const callId = `c_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+    const timer = setTimeout(() => {
+      mcpPending.delete(callId)
+      resolve({ ok: false, error: '渲染层响应超时（30 秒），请重试' })
+    }, 30_000)
+    mcpPending.set(callId, { resolve, timer })
+    wc.send('mcp:invoke', { callId, method, params })
+  })
+}
+
+ipcMain.on('mcp:result', (_event, payload) => {
+  const callId = payload?.callId
+  const pending = mcpPending.get(callId)
+  if (!pending) return
+  clearTimeout(pending.timer)
+  mcpPending.delete(callId)
+  pending.resolve(payload?.result)
+})
+
+/* ------------------------------------------------------------------ */
 /* 启动                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -1061,14 +1178,23 @@ app.on('second-instance', () => {
 })
 
 app.whenReady().then(() => {
+  if (MCP_MODE) {
+    startMcpStdioServer()
+    return
+  }
   setupGrsaiProxy()
   setupAutoUpdater()
   createWindow()
+  startControlServer()
 
   app.on('activate', () => {
     // macOS 关窗后点 dock 图标重建窗口
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
+})
+
+app.on('quit', () => {
+  stopControlServer()
 })
 
 app.on('window-all-closed', () => {

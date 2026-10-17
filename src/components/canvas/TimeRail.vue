@@ -2,6 +2,7 @@
 import { computed } from 'vue'
 import type { GraphSettings, StoryNode } from '@/types/graph'
 import { laneAxisMap } from '@/core/layout'
+import { isCharacterCard } from './characterCard'
 
 const props = withDefaults(
   defineProps<{
@@ -39,10 +40,21 @@ const RAIL_TONES = ['teal', 'gold', 'mist'] as const
 const rails = computed<Rail[]>(() => {
   const { laneGap, direction } = props.settings
   const horizontal = direction === 'horizontal'
-  const axis = laneAxisMap(props.nodes, laneGap)
+
+  // 【人物卡片不画轨道】character 由 `core/layout.ts` 的 `isLayoutExempt` 按 kind
+  // 永久剔出布局集合，位置完全归用户自由摆放。若仍按它的 CHARACTER_LANE(100)
+  // 画一条轨道，卡片散开后 from/to 会横跨整张画布，轨道被拉成一条穿屏长线。
+  // 注意 `laid` 只剔除 character，与 layoutTimeline 里 `laneAxisMap(auto, laneGap)`
+  // 的口径差异仅限于 pinned 节点（auto 连 pinned 一并剔除）：若某条 lane 的节点
+  // 全部被 pinned，该 lane 仍会占一个轴索引，轨道轴与布局实际落位会错开一个
+  // laneGap（既有取舍，非本轮引入，要改需连 filter 一起动、单独评估）。
+  // 边界：工作区里只有人物卡时 `laid` 为空 —— 下面的循环自然不执行，
+  // `laneAxisMap([])` 也安全返回空 Map，不会出现 NaN / 崩溃。
+  const laid = props.nodes.filter((n) => !isCharacterCard(n))
+  const axis = laneAxisMap(laid, laneGap)
 
   const byLane = new Map<number, StoryNode[]>()
-  for (const n of props.nodes) {
+  for (const n of laid) {
     const list = byLane.get(n.lane)
     if (list) list.push(n)
     else byLane.set(n.lane, [n])

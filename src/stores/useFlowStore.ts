@@ -13,6 +13,7 @@ import type {
 import { createEdge, createGraph, createNode, deepClone, nextOrder, DEFAULT_SETTINGS } from '@/core/model'
 import { fitNodeHeight, layoutTimeline, tidyUp } from '@/core/layout'
 import { planCharacterRename, type RenamePlan } from '@/core/characterRename'
+import { nextCharacterSlot } from '@/core/characterSlot'
 import { history } from '@/core/history'
 import { loadWorkspace, saveWorkspace } from '@/core/storage'
 import { createSampleGraph } from '@/core/sample'
@@ -336,9 +337,24 @@ export const useFlowStore = defineStore('flow', () => {
     const copy = deepClone(src)
     copy.id = createNode().id
     copy.title = `${src.title} · 副本`
-    copy.x = src.x + 40
-    copy.y = src.y + 40
-    copy.order = src.order + 1
+    // 人物卡复制：与「新建人物卡」两个入口同一套错位落位，不再 +40/+40
+    // （+40 会让副本与原卡重叠约 156×92）。
+    // order 同理：普通节点的 order 由随后的 layoutTimeline 重编号自愈，
+    // 而人物卡被 isLayoutExempt 永久豁免、没有自愈机会 ——
+    // 照抄 src.order + 1 会在人物道里留下重复 order，导出排序就歧义了。
+    // 两处都必须在 push 之前算：`nextCharacterSlot` 统计的是「已有」人物卡，
+    // push 之后副本自己也会把格子序号往后推。
+    if (src.kind === 'character') {
+      const slot = nextCharacterSlot(g.nodes)
+      copy.x = slot.x
+      copy.y = slot.y
+      const peers = g.nodes.filter((n) => n.kind === 'character' && n.lane === copy.lane)
+      copy.order = peers.length ? Math.max(...peers.map((n) => n.order)) + 1 : 0
+    } else {
+      copy.x = src.x + 40
+      copy.y = src.y + 40
+      copy.order = src.order + 1
+    }
     g.nodes.push(copy)
     if (g.settings.layoutMode === 'timeline') layoutTimeline(g)
     touch(g)

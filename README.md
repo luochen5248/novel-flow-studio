@@ -37,6 +37,56 @@
 - **AI 生图**：接入 grsai 生图 API，为节点配插图
 - **右键菜单**：节点/编辑器内快捷唤起 AI 能力
 
+### 人物卡片与画布增强（0.4.0 新增）
+
+- **人物卡智能落位**：新建人物卡片自动排布在主线/支线内容的右侧空白网格，
+  逐卡递进不叠压，也永远不会被时间线自动布局挪走
+- **节点复制与拖拽增强**：复制行为更完整、拖拽交互更稳（配套 309 例单测覆盖）
+
+### MCP 接入（AI 直接调用与唤醒，0.4.0 新增）
+
+打包后的桌面版内置 MCP（Model Context Protocol）桥：WorkBuddy、Claude Desktop 等 AI
+软件可以通过标准 MCP 协议**唤醒软件**并**调用 API 操作流程图**——新建故事线、增删改
+节点、连边、批量编排、导出、撤销重做。所有调用最终走界面同一条 store 通路：改动
+可见、可 `Ctrl+Z` 撤销、自动保存。
+
+工作原理：
+
+- `小说时间线工坊.exe --mcp`：无窗口桥接实例，随 AI 软件连接而生、断开而退；GUI
+  未运行时负责唤醒主程序（spawn + 健康检查轮询），再把工具调用转发过去
+- GUI 实例常驻本地控制服务器：仅监听 `127.0.0.1`，Bearer token 认证；端口与 token
+  写在用户数据目录的 `control.json`（权限 0600）
+- 业务调用由渲染层 `window.NovelFlow.*` 执行（即浏览器控制台那套可编程 API）
+
+在 WorkBuddy 中接入：
+
+1. 记下 exe 路径（安装版默认 `%LOCALAPPDATA%\Programs\小说时间线工坊\小说时间线工坊.exe`，便携版 / 自定义目录以实际为准）
+2. WorkBuddy → 连接器管理 → 自定义 MCP（`mcp.json`）加入：
+
+   ```json
+   {
+     "mcpServers": {
+       "novelflow": {
+         "command": "C:\\Users\\<你的用户名>\\AppData\\Local\\Programs\\小说时间线工坊\\小说时间线工坊.exe",
+         "args": ["--mcp"]
+       }
+     }
+   }
+   ```
+
+3. 保存后在自定义连接器入口点击「信任」启用
+4. 对 AI 说：「唤醒小说时间线工坊，新建故事线《锚点》，添加三个节点：雨夜初遇 / 旧账 / 抉择」——软件窗口自动弹出，节点上线并自动串联
+
+工具（26 个）：`wake` / `status` / `help` / `list_flows` / `add_flow` / `open_flow` /
+`remove_flow` / `rename_flow` / `get_state` / `add_node` / `add_nodes` / `update_node` /
+`remove_node` / `add_edge` / `remove_edge` / `update_edge` / `add_note` / `add_character` /
+`add_tag` / `set_status` / `set_chapter` / `batch` / `undo` / `redo` / `export` /
+`api`（白名单内任意 NovelFlow 方法的逃生门）。资源：`novelflow://flows`、`novelflow://outline`。
+
+安全说明：控制服务器只绑 127.0.0.1 回环、不涉入网规则；token 为 256 位随机值，与 AI
+模型密钥同库（userData，0600）存放，请勿外传；AI 的全部操作都可 undo；`exportPNG` /
+`download` / `subscribe` 等返回二进制或有 UI 副作用的方法不在白名单内。
+
 ## 快速开始（开发）
 
 ```bash
@@ -60,13 +110,18 @@ npm run dev                  # http://127.0.0.1:5173
 
 ```
 electron/
-  main.cjs     窗口 · grsai 代理接管 · 自动更新 · AI 模型管理与请求代发
-  preload.cjs  contextBridge 最小安全面（更新 / AI IPC）
+  main.cjs           窗口 · grsai 代理接管 · 自动更新 · AI 模型管理与请求代发 ·
+                      MCP 桥接实例（--mcp）与 GUI 侧控制服务器调度
+  preload.cjs        contextBridge 最小安全面（更新 / AI / MCP IPC）
+  control-server.cjs GUI 实例本地控制服务器（127.0.0.1 + Bearer token）
+  mcp/               MCP stdio 桥：protocol（JSON-RPC 帧）· tools（26 工具注册表）·
+                      control-client（HTTP 客户端）· wake（唤醒）· server（stdio 组装）
 ```
 
 主进程职责：加载 Vite 构建产物；打包后没有 dev server，由主进程 `webRequest`
 把渲染层 `/api/grsai/*` 请求重定向到真实 API 并注入密钥；AI 对话流式输出与
-取消也由主进程管理。
+取消也由主进程管理。`--mcp` 启动时进入无窗口桥接模式（跳过单例锁、日志全走
+stderr、stdout 只承载 JSON-RPC 帧）。
 
 ## 界面结构
 
@@ -120,11 +175,12 @@ electron-builder 打包发布，产物为安装包 exe + latest.yml 更新元数
 ## 目录
 
 ```
-electron/            桌面壳（main.cjs · preload.cjs）
+electron/            桌面壳（main.cjs · preload.cjs · control-server.cjs · mcp/）
 src/
   types/             graph.ts 数据契约 · ai.ts AI 模型类型
-  core/              id / model / layout / geometry / history / storage / aiPrompt
+  core/              id / model / layout / geometry / history / storage / aiPrompt / characterSlot
   api/               aiClient（AI 请求客户端）
+  mcp/               rendererBridge（MCP → window.NovelFlow 渲染层调用桥）
   stores/            useFlowStore（图数据）· useUiStore（界面偏好）· useAiStore（AI 模型）
   composables/       useViewport / useNodeDrag / useSelection / useShortcuts / useAiAssist
   components/

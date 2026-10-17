@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import type { Rect, StoryNode } from '@/types/graph'
 import { boundsOf } from '@/core/geometry'
+import { isCharacterCard } from './characterCard'
 
 const props = withDefaults(
   defineProps<{
@@ -38,7 +39,17 @@ function project(p: { x: number; y: number }): { x: number; y: number } {
 const nodesView = computed(() =>
   props.nodes.map((n) => {
     const p = project({ x: n.x, y: n.y })
-    return { id: n.id, x: p.x, y: p.y, w: Math.max(3, n.w * fit.value.k), h: Math.max(2, n.h * fit.value.k), lane: n.lane }
+    return {
+      id: n.id,
+      x: p.x,
+      y: p.y,
+      w: Math.max(3, n.w * fit.value.k),
+      h: Math.max(2, n.h * fit.value.k),
+      lane: n.lane,
+      // 人物卡片既不画时间轨道也不归支线：它按 kind 永久豁免布局，
+      // 落位与 lane 号无关。染成支线金色会误导用户以为它属于某条支线。
+      char: isCharacterCard(n)
+    }
   })
 )
 
@@ -85,7 +96,7 @@ function jumpTo(e: PointerEvent): void {
         v-for="n in nodesView"
         :key="n.id"
         class="nf-minimap__node"
-        :class="{ 'is-branch': n.lane !== 0 }"
+        :class="{ 'is-branch': n.lane !== 0 && !n.char, 'is-character': n.char }"
         :x="n.x"
         :y="n.y"
         :width="n.w"
@@ -133,6 +144,10 @@ function jumpTo(e: PointerEvent): void {
 }
 .nf-minimap__node.is-branch {
   fill: rgba(201, 162, 39, 0.68);
+}
+/* 人物卡片：clay 色系（与卡片本体 --nf-node-clay-bar 同源），不按 lane 染支线金 */
+.nf-minimap__node.is-character {
+  fill: rgba(192, 138, 110, 0.72);
 }
 
 .nf-minimap__viewport {

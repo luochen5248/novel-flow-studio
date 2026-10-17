@@ -53,5 +53,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.on('ai:chunk', listener)
       return () => ipcRenderer.removeListener('ai:chunk', listener)
     }
+  },
+
+  /* ---- MCP 调用桥：主进程控制服务器 ↔ 渲染层 window.NovelFlow ---- */
+  mcp: {
+    /** 订阅调用载荷 { callId, method, params }；返回取消订阅函数 */
+    onInvoke: (callback) => {
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on('mcp:invoke', listener)
+      return () => ipcRenderer.removeListener('mcp:invoke', listener)
+    },
+    /** 回传执行结果（形状与 NovelFlow 的 { ok, data?, error? } 一致） */
+    reply: (callId, result) => ipcRenderer.send('mcp:result', { callId, result })
   }
 })

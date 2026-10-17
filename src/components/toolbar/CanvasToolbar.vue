@@ -6,6 +6,7 @@ import { useUiStore } from '@/stores/useUiStore'
 import { useViewport } from '@/composables/useViewport'
 import { boundsOf } from '@/core/geometry'
 import { CHARACTER_LANE, CHARACTER_NODE_W } from '@/components/canvas/characterCard'
+import { nextCharacterSlot } from '@/core/characterSlot'
 
 const store = useFlowStore()
 const ui = useUiStore()
@@ -45,18 +46,26 @@ function toggleLayoutMode(): void {
  * 若允许重名，后建的那张牌会把先建那张的挂载关系一起认走、改名时还会被
  * 「已有同名人物」拒绝而无法自救。从源头保证不存在同名角色牌。
  * 手法与 useFlowStore.insertBranch 找空位一致。
+ *
+ * 落位：必须**显式给坐标**。人物卡片被 `isLayoutExempt` 永久剔出布局集合，
+ * `layoutTimeline` 永远不会再给它排一次位；若留给 `createNode` 兜底 (0, 0)，
+ * 新建的第 2 张起就会与前一张叠成一坨，用户得先手动扒开才能用。
+ * 规则统一走 core 纯函数 `nextCharacterSlot`（4 列一行网格错位），便于单测。
  */
 function addCharacterCard(): void {
   const used = store.nodes.filter((n) => n.kind === 'character').map((n) => n.title)
   let title = '新人物'
   let i = 2
   while (used.includes(title)) title = `新人物 ${i++}`
+  const slot = nextCharacterSlot(store.nodes)
   const node = store.addNode({
     kind: 'character',
     title,
     color: 'clay',
     lane: CHARACTER_LANE,
-    w: CHARACTER_NODE_W
+    w: CHARACTER_NODE_W,
+    x: slot.x,
+    y: slot.y
   })
   if (!node) return
   ui.notify('已添加人物卡片：拖到事件 / 场景节点上即可挂载为该节点人物')

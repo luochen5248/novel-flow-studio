@@ -396,21 +396,12 @@ function currentTolerance(): number {
 /** 正在被拖动的人物卡片 id（拖的是普通节点时为 null） */
 const draggingCharacterId = ref<string | null>(null)
 
-/**
- * 拖动人物卡片**之前**它自己的位置。
- *
- * 用途：挂载成功后把人物卡片本体放回这里，而不是让它停在目标卡片上
- * （否则角色牌会与事件卡视觉重叠，见 P1-3）。
- */
-let characterOrigin: { x: number; y: number } | null = null
-
 /** 摘掉人物挂载的 window 监听并清空挂载态（松手 / Esc / 卸载都走这里，保证只清一次） */
 function endCharacterDrag(): void {
   window.removeEventListener('pointermove', onCharacterDragMove)
   window.removeEventListener('pointerup', onCharacterDragUp)
   draggingCharacterId.value = null
   mountSnapTargetId.value = null
-  characterOrigin = null
 }
 
 /**
@@ -451,19 +442,23 @@ function onCharacterDragMove(e: PointerEvent): void {
 }
 
 /**
- * 松手：把人物名挂进目标节点的 characters，并让角色牌本体回到自己的原位。
+ * 松手：把人物名挂进目标节点的 characters，**卡片位置永远跟随松手处**。
  *
- * 关键约定（挂载交互与「移动角色牌本体」解耦）：
+ * 关键约定（挂载与搬家彻底解耦）：
  *  - 拖动过程里 useNodeDrag 会照常把卡片本体移到指针下 —— 这是拖拽的通用语义，
  *    不能因为「这次拖动最终会变成一次挂载」就中途禁用，否则卡片会粘手。
- *  - 挂载成功的那一刻，把 x/y 还原到 `characterOrigin`，角色牌就弹回原位，
- *    不再压在目标卡片上。还原同时打 pinned，用户之后自由摆放它不会被布局吸回。
- *  - 挂载失败（无目标 / 空名）则不做还原：用户就是想移动它，位置应当保留。
+ *  - 挂载只写入 `target.characters` 这一条**出场关系**，不碰卡片的 x/y：
+ *    人物卡片由 `isLayoutExempt` 按 kind 永久豁免布局，坐标本来就归用户管，
+ *    松手处就是它该在的地方（用户决策 1）。旧实现在这里把 x/y 还原回拖动前、
+ *    并补一个 `pinned`，等于「挂载成功反而被弹回原位」，与「拖到哪停哪」冲突。
+ *  - 也不再打 `pinned`：① character 已按 kind 豁免，pinned 对它是多余的标记；
+ *    ② 这张卡日后若被改成 `event`，残留的 pinned 会让它变成主线上的钉子，
+ *    只有「整理」能清（而 character 按 kind 豁免、「整理」清不掉 kind）。
+ *  - 挂载失败（无目标 / 空名）同样保留新位置：用户就是想移动它。
  */
 function onCharacterDragUp(): void {
   const cid = draggingCharacterId.value
   const targetId = mountSnapTargetId.value
-  const origin = characterOrigin
   endCharacterDrag()
   if (!cid) return
   const card = store.nodes.find((n) => n.id === cid)
@@ -472,7 +467,7 @@ function onCharacterDragUp(): void {
 
   if (!name || !target) {
     // 没挂上：保留用户拖出来的位置
-    if (name && !target && origin) ui.notify('没有可挂载的节点 —— 已保留人物卡片的新位置')
+    if (name && !target) ui.notify('没有可挂载的节点 —— 已保留人物卡片的新位置')
     return
   }
   if (target.characters.includes(name)) {
@@ -480,17 +475,12 @@ function onCharacterDragUp(): void {
     return
   }
   store.addCharacter(target.id, name)
-  // 角色牌弹回自己的原位并打 pinned：挂载 ≠ 搬家
-  if (origin) {
-    store.updateNode(cid, { x: origin.x, y: origin.y, pinned: true }, { silent: true })
-  }
-  ui.notify(`「${name}」已挂到「${target.title}」`)
+  ui.notify(`「${name}」已挂到「${target.title}」，卡片位置已保留`)
 }
 
 function onCharacterDragStart(node: StoryNode): void {
   if (!isCharacterCard(node)) return
   draggingCharacterId.value = node.id
-  characterOrigin = { x: node.x, y: node.y }
   window.addEventListener('pointermove', onCharacterDragMove)
   window.addEventListener('pointerup', onCharacterDragUp)
 }
