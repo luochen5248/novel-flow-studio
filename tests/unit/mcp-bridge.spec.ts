@@ -8,7 +8,11 @@
  *     initialize 门禁、协议版本回弹、通知不应答、tools/list、tools/call
  *     （含唤醒触发与错误路径）、resources、坏行 -32700；
  *  C. rendererBridge.ts（jsdom）：正常回包 / 方法不存在 / 抛异常归一 /
- *     NovelFlow 未就绪 / 无 electronAPI 静默跳过。
+ *     NovelFlow 未就绪 / 无 electronAPI 静默跳过；
+ *  D. standalone.cjs：userData/exe 路径解析、版本提取、GUI spawn 环境清洗
+ *     （ELECTRON_RUN_AS_NODE/NODE_OPTIONS 剥离，2026-10-17 实测根因）与
+ *     spawner 的存在性预检 / error 兜底；
+ *  E. control-server.cjs：control.json 心跳自愈与 removeControlFile 的 pid 守卫。
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest'
 import { createRequire } from 'node:module'
@@ -16,7 +20,20 @@ import { createRequire } from 'node:module'
 const require = createRequire(import.meta.url)
 const { createWaker } = require('../../electron/mcp/wake.cjs')
 const { createMcpServer } = require('../../electron/mcp/server.cjs')
+const {
+  resolveUserDataDir,
+  resolveGuiExe,
+  parseVersionFromYml,
+  buildGuiSpawnEnv,
+  createGuiSpawner,
+  GUI_EXE_NAME
+} = require('../../electron/mcp/standalone.cjs')
+const { createControlServer } = require('../../electron/control-server.cjs')
 const { PassThrough } = require('node:stream')
+const { EventEmitter } = require('node:events')
+const nodeFs = require('node:fs')
+const nodeOs = require('node:os')
+const nodePath = require('node:path')
 
 const silent = { log() {}, error() {} }
 
@@ -394,5 +411,208 @@ describe('rendererBridge · 渲染层调用桥', () => {
     await expect(import('@/mcp/rendererBridge')).resolves.toBeDefined()
     // 还原环境，避免影响后续（无更多用例，仅为整洁）
     ;(window as any).electronAPI = { mcp: { onInvoke: () => () => {}, reply: () => {} } }
+  })
+})
+
+/* ================================================================== */
+/* D · standalone.cjs 路径解析 / 版本提取 / GUI spawn 环境清洗            */
+/* ================================================================== */
+
+describe('standalone · 路径与版本解析', () => {
+  it('S1 resolveUserDataDir：win32 取 %APPDATA%/<name>', () => {
+    expect(
+      resolveUserDataDir({
+        env: { APPDATA: 'C:\\Users\\x\\AppData\\Roaming', NOVELFLOW_USERDATA: undefined },
+        platform: 'win32'
+      })
+    ).toBe('C:\\Users\\x\\AppData\\Roaming\\novelflow-studio')
+  })
+
+  it('S2 resolveUserDataDir：darwin / linux 分支', () => {
+    expect(resolveUserDataDir({ env: { HOME: '/home/x' }, platform: 'darwin' })).toBe(
+      nodePath.join('/home/x', 'Library', 'Application Support', 'novelflow-studio')
+    )
+    expect(resolveUserDataDir({ env: { HOME: '/home/x' }, platform: 'linux' })).toBe(
+      nodePath.join('/home/x', '.config', 'novelflow-studio')
+    )
+  })
+
+  it('S3 resolveUserDataDir：env 覆盖优先（测试注入口）', () => {
+    expect(resolveUserDataDir({ env: { NOVELFLOW_USERDATA: 'D:/tmp/ud' }, platform: 'win32' })).toBe('D:/tmp/ud')
+  })
+
+  it('S4 resolveGuiExe：env 覆盖 > execPath 自识别 > 桥接同目录', () => {
+    expect(resolveGuiExe({ env: { NOVELFLOW_GUI_EXE: 'D:/x.exe' }, execPath: 'C:/node.exe', moduleDir: 'D:/mcp' })).toBe(
+      'D:/x.exe'
+    )
+    expect(
+      resolveGuiExe({ env: {}, execPath: 'C:/Program Files/novelflow-studio/小说时间线工坊.exe', moduleDir: 'D:/mcp' })
+    ).toBe('C:/Program Files/novelflow-studio/小说时间线工坊.exe')
+    expect(resolveGuiExe({ env: {}, execPath: 'C:/node.exe', moduleDir: 'D:/mcp' })).toBe(
+      nodePath.join('D:/mcp', GUI_EXE_NAME)
+    )
+  })
+
+  it('S5 parseVersionFromYml：提取 / 缺失 / 损坏', () => {
+    expect(parseVersionFromYml('version: 0.4.0\nfoo: bar')).toBe('0.4.0')
+    expect(parseVersionFromYml('')).toBe('0.0.0')
+    expect(parseVersionFromYml('no version here')).toBe('0.0.0')
+  })
+})
+
+describe('standalone · GUI spawn 环境清洗（2026-10-17 实测根因）', () => {
+  it('S6 buildGuiSpawnEnv：剥离 ELECTRON_RUN_AS_NODE 与 NODE_OPTIONS，其余原样', () => {
+    const input = {
+      PATH: 'C:\\Windows',
+      APPDATA: 'C:\\Users\\x\\AppData\\Roaming',
+      ELECTRON_RUN_AS_NODE: '1',
+      NODE_OPTIONS: '--require=C:/shim.cjs',
+      NOVELFLOW_GUI_EXE: 'C:/app.exe'
+    }
+    const clean = buildGuiSpawnEnv(input)
+    expect(clean.ELECTRON_RUN_AS_NODE).toBeUndefined()
+    expect(clean.NODE_OPTIONS).toBeUndefined()
+    expect(clean.PATH).toBe('C:\\Windows')
+    expect(clean.APPDATA).toBe(input.APPDATA)
+    expect(clean.NOVELFLOW_GUI_EXE).toBe('C:/app.exe')
+    // 不改调用方对象
+    expect(input.ELECTRON_RUN_AS_NODE).toBe('1')
+  })
+
+  it('S7 createGuiSpawner：exe 缺失 → 同步抛错并指路 NOVELFLOW_GUI_EXE', () => {
+    const spawner = createGuiSpawner({
+      guiExe: 'D:/nope/小说时间线工坊.exe',
+      fsImpl: { existsSync: () => false }
+    })
+    expect(() => spawner()).toThrow(/NOVELFLOW_GUI_EXE/)
+    expect(() => spawner()).toThrow(/未找到主程序可执行文件/)
+  })
+
+  it('S8 createGuiSpawner：spawn 参数/env 清洗/error 兜底/unref', () => {
+    const child = new EventEmitter() as any
+    child.unref = vi.fn()
+    const spawnImpl = vi.fn(
+      (
+        _file: string,
+        _args: string[],
+        _opts: { detached?: boolean; stdio?: unknown; env: Record<string, string | undefined> }
+      ) => child
+    )
+    const errors: unknown[] = []
+    const spawner = createGuiSpawner({
+      guiExe: 'C:/app/小说时间线工坊.exe',
+      env: { PATH: 'C:\\Windows', ELECTRON_RUN_AS_NODE: '1' },
+      spawnImpl,
+      fsImpl: { existsSync: () => true },
+      logger: { log() {}, error: (...a: unknown[]) => errors.push(a) }
+    })
+    spawner()
+    expect(spawnImpl).toHaveBeenCalledTimes(1)
+    const [file, args, opts] = spawnImpl.mock.calls[0]
+    expect(file).toBe('C:/app/小说时间线工坊.exe')
+    expect(args).toEqual([])
+    expect(opts.detached).toBe(true)
+    expect(opts.stdio).toBe('ignore')
+    expect(opts.env.ELECTRON_RUN_AS_NODE).toBeUndefined()
+    expect(opts.env.PATH).toBe('C:\\Windows')
+    expect(child.unref).toHaveBeenCalled()
+    // 异步 error 不再以未捕获异常崩掉桥接，仅记录日志
+    expect(() => child.emit('error', new Error('boom'))).not.toThrow()
+    expect(errors.length).toBe(1)
+    expect(String(errors[0])).toContain('boom')
+  })
+})
+
+/* ================================================================== */
+/* E · control-server.cjs 心跳自愈 / pid 守卫                            */
+/* ================================================================== */
+
+describe('controlServer · control.json 心跳与删除守卫', () => {
+  let tmpDir: string
+
+  function readControlFile(dir: string) {
+    return JSON.parse(nodeFs.readFileSync(nodePath.join(dir, 'control.json'), 'utf-8'))
+  }
+
+  function writeControlFile(dir: string, payload: unknown) {
+    nodeFs.writeFileSync(nodePath.join(dir, 'control.json'), JSON.stringify(payload), 'utf-8')
+  }
+
+  it('E-a 心跳：文件被外部篡改后一个周期内自我修正', async () => {
+    tmpDir = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'nf-cs-hb-'))
+    const server = createControlServer({
+      userDataDir: tmpDir,
+      invoke: async () => ({ ok: true }),
+      focus: () => {},
+      version: '9.9.9',
+      port: 0,
+      heartbeatMs: 40,
+      logger: silent
+    })
+    await server.start()
+    const own = readControlFile(tmpDir)
+    expect(own.pid).toBe(process.pid)
+
+    writeControlFile(tmpDir, { port: 1, token: 'stale', pid: 999999, version: '0.0.0', startedAt: 1 })
+    await new Promise((r) => setTimeout(r, 120))
+    const healed = readControlFile(tmpDir)
+    expect(healed.token).toBe(own.token)
+    expect(healed.port).toBe(own.port)
+    expect(healed.pid).toBe(process.pid)
+
+    server.stop()
+  })
+
+  it('E-b heartbeatMs=0：不起心跳，篡改不被修正', async () => {
+    tmpDir = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'nf-cs-nohb-'))
+    const server = createControlServer({
+      userDataDir: tmpDir,
+      invoke: async () => ({ ok: true }),
+      focus: () => {},
+      version: '9.9.9',
+      port: 0,
+      heartbeatMs: 0,
+      logger: silent
+    })
+    await server.start()
+    writeControlFile(tmpDir, { port: 1, token: 'stale', pid: 999999, version: '0.0.0', startedAt: 1 })
+    await new Promise((r) => setTimeout(r, 80))
+    expect(readControlFile(tmpDir).token).toBe('stale')
+    server.stop()
+  })
+
+  it('E-c removeControlFile pid 守卫：外来条目不删，自己的条目才删', async () => {
+    tmpDir = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'nf-cs-pid-'))
+    const server = createControlServer({
+      userDataDir: tmpDir,
+      invoke: async () => ({ ok: true }),
+      focus: () => {},
+      version: '9.9.9',
+      port: 0,
+      heartbeatMs: 0,
+      logger: silent
+    })
+    await server.start()
+    const own = readControlFile(tmpDir)
+
+    // 外来条目（模拟旧版让位实例覆盖 / 新主进程已接管）→ stop 不得删除
+    writeControlFile(tmpDir, { ...own, pid: 999999, token: 'other' })
+    server.stop()
+    expect(nodeFs.existsSync(nodePath.join(tmpDir, 'control.json'))).toBe(true)
+
+    // 自己的条目 → stop 删除（stop 已调用过一次，这里直接验证文件仍属外来条目）
+    // 重新起一个实例验证「自己的条目被删」
+    const server2 = createControlServer({
+      userDataDir: tmpDir,
+      invoke: async () => ({ ok: true }),
+      focus: () => {},
+      version: '9.9.9',
+      port: 0,
+      heartbeatMs: 0,
+      logger: silent
+    })
+    await server2.start()
+    server2.stop()
+    expect(nodeFs.existsSync(nodePath.join(tmpDir, 'control.json'))).toBe(false)
   })
 })

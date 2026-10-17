@@ -24,15 +24,30 @@ const GRSAI_TARGET = 'https://grsai.dakka.com.cn'
 const GRSAI_PREFIX = '/api/grsai'
 
 /* ------------------------------------------------------------------ */
-/* 启动模式：--mcp = 无窗口 MCP 桥接实例（必须在单例锁之前判断）                        */
+/* 启动模式：无窗口 MCP 桥接实例（必须在单例锁之前判断）                                */
+/* 判定入口二选一：                                                                */
+/*   ① process.env.NOVELFLOW_MCP === '1' —— 打包态唯一可用方式。                           */
+/*      Electron 44 起 Windows exe 的 CLI 解析为 Node 风格，未知 -- 长参数直接               */
+/*      「bad option」+ exit 9（实验实证：electron=44.7.0/node=24.21.0，--mcp/--dev 均被    */
+/*      二进制层拒绝，进程到不了 main.cjs）。MCP 客户端（如 WorkBuddy mcp.json 的 env 字段）  */
+/*      只能走环境变量传令。                                                            */
+/*   ② process.argv.includes('--mcp') —— 开发态兼容：npm run dev:electron 一类             */
+/*      「electron main.cjs --mcp」中 --mcp 位于 script 参数位，Node CLI 原样透传。          */
 /* ------------------------------------------------------------------ */
-const MCP_MODE = process.argv.includes('--mcp')
+const MCP_MODE = process.argv.includes('--mcp') || process.env.NOVELFLOW_MCP === '1'
+
+/**
+ * 单例锁归属（GUI 实例专用；MCP 桥接实例不参与抢锁）。
+ * 让位实例必须在 whenReady 里早退——详见该处注释（2026-10-17 实测 bug 修复）。
+ */
+let HAS_SINGLE_INSTANCE_LOCK = true
 
 if (MCP_MODE) {
   // MCP 客户端每次连接都会 spawn 一个新进程：若照抢单例锁，GUI 已在运行时会
   // 把桥接实例自己挡退。桥接无窗口、不碰业务数据，与 GUI 实例必须能共存。
-} else if (!app.requestSingleInstanceLock()) {
-  app.quit()
+} else {
+  HAS_SINGLE_INSTANCE_LOCK = app.requestSingleInstanceLock()
+  if (!HAS_SINGLE_INSTANCE_LOCK) app.quit()
 }
 
 /* ------------------------------------------------------------------ */
@@ -1180,6 +1195,14 @@ app.on('second-instance', () => {
 app.whenReady().then(() => {
   if (MCP_MODE) {
     startMcpStdioServer()
+    return
+  }
+  if (!HAS_SINGLE_INSTANCE_LOCK) {
+    // 让位实例早退（2026-10-17 实测修复）：app.quit() 在 ready 前调用会被 Electron
+    // 推迟，whenReady 回调仍会完整跑完——若不在此拦截，让位实例会建窗并启动控制
+    // 服务器，把 userData/control.json 覆盖成自己（随即退出）的死进程信息，
+    // 主实例的接入文件被污染，MCP 桥接随即连不上真正存活的主程序。
+    app.exit(0)
     return
   }
   setupGrsaiProxy()

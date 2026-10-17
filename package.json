@@ -1,6 +1,6 @@
 {
   "name": "novelflow-studio",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "description": "小说时间线流程图工坊 —— 为长篇小说作者准备的本地故事脉络绘制工具",
@@ -47,6 +47,13 @@
     "files": [
       "dist/**/*",
       "electron/**/*"
+    ],
+    "extraFiles": [
+      {
+        "from": "electron/mcp",
+        "to": "mcp",
+        "filter": ["**/*"]
+      }
     ],
     "win": {
       "target": [

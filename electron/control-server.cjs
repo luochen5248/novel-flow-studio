@@ -18,11 +18,20 @@ const path = require('node:path')
 const DEFAULT_PORT = 32117
 const MAX_BODY_BYTES = 10 * 1024 * 1024
 
-function createControlServer({ userDataDir, invoke, focus, version = '0.0.0', port = DEFAULT_PORT, logger } = {}) {
+function createControlServer({
+  userDataDir,
+  invoke,
+  focus,
+  version = '0.0.0',
+  port = DEFAULT_PORT,
+  heartbeatMs = 30_000,
+  logger
+} = {}) {
   const log = logger || { log() {}, error() {} }
   const token = crypto.randomBytes(32).toString('hex')
   const controlPath = path.join(userDataDir, 'control.json')
   let actualPort = port
+  let heartbeatTimer = null
 
   function writeControlFile() {
     const payload = {
@@ -41,6 +50,15 @@ function createControlServer({ userDataDir, invoke, focus, version = '0.0.0', po
   }
 
   function removeControlFile() {
+    // pid 守卫：只删属于自己的条目。防两种真实竞态——
+    //   ① 主进程 A 退出清理时，新主进程 B 已写好文件：无守卫会误删 B 的接入文件；
+    //   ② 旧版让位实例（未修 main.cjs 时）覆盖过文件：其退出不应牵连主实例条目。
+    try {
+      const cur = JSON.parse(fs.readFileSync(controlPath, 'utf-8'))
+      if (cur && typeof cur === 'object' && cur.pid !== process.pid) return
+    } catch {
+      /* 不存在或损坏：照删 */
+    }
     try {
       fs.unlinkSync(controlPath)
     } catch {
@@ -163,10 +181,21 @@ function createControlServer({ userDataDir, invoke, focus, version = '0.0.0', po
     actualPort = server.address().port
     writeControlFile()
     log.log(`[mcp] 控制服务器已监听 127.0.0.1:${actualPort}（token 已写入 control.json）`)
+    // 心跳刷新：control.json 被外部改写（旧版让位实例、用户手动编辑）时，主实例
+    // 至多一个周期内把文件修正回自己的存活条目；桥接每次请求都重读该文件，故下一
+    // 轮 health 轮询即可恢复接入（2026-10-17 实测污染场景的兜底自愈）。
+    if (heartbeatMs > 0) {
+      heartbeatTimer = setInterval(writeControlFile, heartbeatMs)
+      heartbeatTimer.unref?.()
+    }
     return { port: actualPort, token }
   }
 
   function stop() {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer)
+      heartbeatTimer = null
+    }
     removeControlFile()
     server.close()
   }
