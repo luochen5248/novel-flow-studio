@@ -14,7 +14,7 @@
  *
  * 约定：本文件为 CommonJS（.cjs），与 package.json 的 "type": "module" 隔离，避免 ESM 坑。
  */
-const { app, BrowserWindow, Menu, ipcMain, session } = require('electron')
+const { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, session } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
 
@@ -860,7 +860,28 @@ function setupAutoUpdater() {
 
 let mainWindow = null
 
+/** 托盘图标（仅 GUI 实例持有；MCP 桥接实例与让位实例绝不创建） */
+let tray = null
+/** 「已最小化到托盘」气泡只提示第一次，之后再隐藏到托盘不再打扰 */
+let trayHintShown = false
+
+/**
+ * close 事件的放行开关。
+ *
+ * 为什么放在 before-quit 而不是各处手动置位：quit 的路径不止一条——
+ * 托盘菜单「退出」、window-all-closed、autoUpdater.quitAndInstall（检查更新后
+ * 安装）都会走到 app 的退出流程，只有 before-quit 是它们的公共前哨。漏掉任何
+ * 一条，窗口都会在 close 时被下面这段 hide 逻辑拦下来，表现为点了退出却退不掉。
+ */
+app.isQuitting = false
+
 function createWindow() {
+  // 窗口图标：主要服务开发态（npm run dev:electron）。
+  // 打包后 Windows 的任务栏 / 标题栏用的是 exe 内嵌图标，electron-builder 会自动
+  // 从 build/icon.png 取，不需要在这里再指一次，也不用改 package.json。
+  // 加 existsSync 守卫：图标文件还没落盘时不能直接把启动搞挂。
+  const appIconPath = path.join(__dirname, 'assets', 'app-icon.png')
+
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
@@ -868,6 +889,7 @@ function createWindow() {
     minHeight: 640,
     title: '小说时间线工坊 · NovelFlow Studio',
     backgroundColor: '#0F1720',
+    icon: fs.existsSync(appIconPath) ? appIconPath : undefined,
     show: false,
     autoHideMenuBar: true,
     webPreferences: {
@@ -881,10 +903,38 @@ function createWindow() {
   // 去掉英文默认菜单（File/Edit/View...），保持全中文观感
   Menu.setApplicationMenu(null)
 
-  mainWindow.once('ready-to-show', () => mainWindow?.show())
+  // 首次露面就铺满屏幕（任务栏仍然可见，不是 setFullScreen 的无边框全屏）
+  mainWindow.once('ready-to-show', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    mainWindow.maximize()
+    mainWindow.show()
+  })
+
   mainWindow.on('closed', () => {
     mainWindow = null
   })
+
+  /**
+   * 关闭 = 隐藏到托盘。
+   * 只有真正退出（before-quit 已把 app.isQuitting 置 true）时才放行关闭事件，
+   * 否则一律 preventDefault + hide，让应用在后台继续活着（MCP 控制服务器照常服务）。
+   */
+  mainWindow.on('close', (event) => {
+    // 托盘没建起来（图标缺失 / 初始化失败）时不能拦关闭：否则窗口会被藏起来却无处唤回
+    if (app.isQuitting || !tray) return
+    event.preventDefault()
+    mainWindow?.hide()
+    // 只在第一次隐藏时说明「去哪了」，之后不再重复（Windows 才有 balloons）
+    if (process.platform === 'win32' && !trayHintShown) {
+      trayHintShown = true
+      tray.displayBalloon({
+        title: '小说时间线工坊',
+        content: '已最小化到系统托盘，点击托盘图标可恢复窗口'
+      })
+    }
+  })
+
+  setupTray()
 
   // 开发模式：npm run dev:electron（主进程带 --dev 参数）→ 加载 dev server
   const isDev = process.argv.includes('--dev')
@@ -893,6 +943,57 @@ function createWindow() {
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'))
   }
+}
+
+/**
+ * 托盘：显示主窗口 / 退出。
+ *
+ * 只在 createWindow 的成功路径里调用，天然屏蔽三种不该出现托盘的场景：
+ * MCP_MODE 桥接实例（无窗口）、单例让位实例、创建窗口失败。
+ * 再加一道显式兜底，防止将来有人在别处误调用。
+ */
+function setupTray() {
+  if (MCP_MODE || !HAS_SINGLE_INSTANCE_LOCK) return
+  // macOS 的 activate 会重建窗口，此时旧托盘还在，不能重复 new Tray
+  if (tray) return
+  try {
+    const iconPath = path.join(__dirname, 'assets', 'tray-icon.png')
+    // 为什么用 createFromBuffer 而不是 createFromPath：
+    // electron-builder 默认 asar 打包，__dirname 落在 app.asar 内部，而
+    // nativeImage.createFromPath 对 asar 内路径有长期未修的缺陷（electron/electron#24221，
+    // 典型报错场景正是 Tray）：它**返回空图而不抛异常**，于是下面的 isEmpty() 会让托盘
+    // 静默失效——开发态（无 asar）却完全正常，本地怎么测都测不出来。
+    // 主进程的 node fs 是 asar-aware 的，先读成 Buffer 再构造，对 dev 与打包版都成立。
+    const icon = nativeImage.createFromBuffer(fs.readFileSync(iconPath))
+    // 图标缺失 / 初始化失败就退化为「无托盘 + 关闭即退出」，宁可少个入口，
+    // 也不能让窗口藏进一个唤不回来的地方
+    if (icon.isEmpty()) {
+      console.error('[tray] 托盘图标读取失败（空图），已跳过托盘初始化')
+      return
+    }
+    tray = new Tray(icon)
+  } catch (error) {
+    // 读盘失败 / 构造失败都落到这里：同样按「无托盘」降级
+    console.error('[tray] 托盘初始化失败：', error?.message ?? String(error))
+    return
+  }
+
+  tray.setToolTip('小说时间线工坊 · NovelFlow Studio')
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: '显示主窗口', click: focusMainWindow },
+      { type: 'separator' },
+      {
+        label: '退出',
+        click: () => {
+          app.isQuitting = true
+          app.quit()
+        }
+      }
+    ])
+  )
+  // 单击托盘图标（Windows 语义）直接唤回窗口
+  tray.on('click', focusMainWindow)
 }
 
 /* ------------------------------------------------------------------ */
@@ -1186,10 +1287,20 @@ ipcMain.on('mcp:result', (_event, payload) => {
 /* ------------------------------------------------------------------ */
 
 app.on('second-instance', () => {
-  if (mainWindow) {
-    if (mainWindow.isMinimized()) mainWindow.restore()
-    mainWindow.focus()
-  }
+  // 窗口可能已「关闭」到托盘里（隐藏态），这时只有 focusMainWindow 的 show 能把它带回前台
+  focusMainWindow()
+})
+
+// 所有退出路径的公共前哨：越早置位越好，保证上面那些 close 拦截不会被卡住
+app.on('before-quit', () => {
+  app.isQuitting = true
+})
+
+// Windows 关机 / 注销 / 重启：系统发的是 WM_QUERYENDSESSION，不一定走 before-quit，
+// 若不在这里放开，close 的 preventDefault 会让 Windows 判定「本应用阻止你关机」。
+// 所以把这条当作 before-quit 之外的第二道放行闸。
+app.on('session-end', () => {
+  app.isQuitting = true
 })
 
 app.whenReady().then(() => {
@@ -1218,6 +1329,14 @@ app.whenReady().then(() => {
 
 app.on('quit', () => {
   stopControlServer()
+  // 必须显式 destroy：不销毁的话部分 Windows 环境里进程退出后托盘图标会残留在通知区，
+  // 要等鼠标划过才消失。destroy 本身可能抛（托盘已被系统回收），不能让它挡住退出流程。
+  try {
+    tray?.destroy()
+  } catch {
+    /* 销毁失败无需阻塞退出 */
+  }
+  tray = null
 })
 
 app.on('window-all-closed', () => {

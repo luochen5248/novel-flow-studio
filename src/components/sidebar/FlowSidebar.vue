@@ -118,15 +118,17 @@ async function onFile(e: Event): Promise<void> {
       </li>
     </ul>
 
-    <footer class="nf-sidebar__foot">
-      <span class="nf-mono-label">本地存储 · 自动保存</span>
-    </footer>
+    <!--
+      底部条带的高度在这里占位（分隔线 + 文案由 AppShell 里的 ControlCenter 覆盖渲染）：
+      控制中心必须挂在侧栏之外，否则侧栏折叠（width:0 + overflow:hidden）会把入口一起裁掉。
+    -->
+    <footer class="nf-sidebar__foot" aria-hidden="true" />
   </aside>
 </template>
 
 <style scoped>
 .nf-sidebar {
-  width: 268px;
+  width: var(--nf-sidebar-w, 268px);
   flex: none;
   display: flex;
   flex-direction: column;
@@ -242,8 +244,9 @@ async function onFile(e: Event): Promise<void> {
   color: var(--nf-on-dark-faint);
 }
 
+/* 纯占位：高度须与 ControlCenter 展开态（10 + 28 + 14）一致，让覆盖层正好落在这条带上 */
 .nf-sidebar__foot {
-  padding: 10px 14px 14px;
-  border-top: 1px solid var(--nf-shell-line-soft);
+  flex: none;
+  height: 52px;
 }
 </style>

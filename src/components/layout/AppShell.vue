@@ -7,6 +7,7 @@ import { boundsOf } from '@/core/geometry'
 import { useFlowStore } from '@/stores/useFlowStore'
 import type { StoryNode } from '@/types/graph'
 import AppHeader from './AppHeader.vue'
+import ControlCenter from './ControlCenter.vue'
 import FlowSidebar from '@/components/sidebar/FlowSidebar.vue'
 import CanvasToolbar from '@/components/toolbar/CanvasToolbar.vue'
 import FlowCanvas from '@/components/canvas/FlowCanvas.vue'
@@ -56,6 +57,12 @@ function onAiOpenChange(value: boolean): void {
           <NodeInspector @open-ai-image="openAiImage" />
         </div>
       </main>
+      <!--
+        控制中心单点挂载在侧栏之外：挂在侧栏里会被折叠态的 overflow:hidden 裁掉。
+        它自己按 ui.sidebarCollapsed 切换「footer 条带 / 浮标胶囊」两种形态，
+        三个对话框随它走，全仓仍只有一份。
+      -->
+      <ControlCenter />
     </div>
 
     <!-- 全局浮层：抽屉 / 弹窗 / 控制台均由 antd portal 渲染，挂载在此即可 -->
@@ -74,10 +81,12 @@ function onAiOpenChange(value: boolean): void {
   color: var(--nf-on-dark);
 }
 
+/* position:relative 是给 ControlCenter 的绝对定位做参照（贴 body 左下角 = 侧栏底部条带） */
 .nf-shell__body {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
+  position: relative;
 }
 
 .nf-shell__main {

@@ -14,6 +14,8 @@
   --nf-shell-600: #22303f;
   --nf-shell-line: rgba(148, 172, 196, 0.14);
   --nf-shell-line-soft: rgba(148, 172, 196, 0.08);
+  /* 侧栏宽度：FlowSidebar（真实宽度）与 ControlCenter（覆盖层对齐用）共用，改一处即可 */
+  --nf-sidebar-w: 268px;
 
   /* ---------- 画布 ---------- */
   --nf-paper: #faf8f4;

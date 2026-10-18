@@ -14,11 +14,22 @@
 
 ### 自动更新
 
-软件右上角有「检查更新」按钮（下载图标）：
+「检查更新」入口在左下角**控制中心**（「关于」分组）：
 
 - 点击后自动比对 GitHub Releases 上的最新版本
 - 发现新版本 → 确认下载（显示进度条）→ 「立即安装并重启」
 - 升级为 NSIS 静默替换安装，**故事线数据与 AI 模型配置全程保留**
+
+### 控制中心与系统托盘（0.4.2 新增）
+
+- **控制中心**：左下角常驻入口，点击弹出「设置中心」大弹窗（左栏分组导航 + 右栏说明与操作）。
+  原先散落在右上角的检查更新、AI 模型管理、AI 生图密钥、开发者控制台、画布切换、外观切换
+  六项全部收在这里；顶栏只保留导出菜单与文档信息
+- **系统托盘**：点右上角关闭按钮不会退出，而是隐藏到系统托盘（首次隐藏有气泡提示）；
+  单击托盘图标恢复窗口，右键菜单「显示主窗口 / 退出」，**只有托盘「退出」才真正退出**
+- **启动即最大化**：每次启动默认最大化窗口，无需手动拉伸
+- **新应用图标**：品牌图标由脚本生成（`scripts/generate-tray-icon.cjs` 托盘 32²、
+  `scripts/generate-app-icon.cjs` 运行时 256²，源图 `build/icon.png` 1024² 供打包拾取）
 
 ## 功能亮点
 
@@ -41,7 +52,7 @@
 
 - **人物卡智能落位**：新建人物卡片自动排布在主线/支线内容的右侧空白网格，
   逐卡递进不叠压，也永远不会被时间线自动布局挪走
-- **节点复制与拖拽增强**：复制行为更完整、拖拽交互更稳（配套 309 例单测覆盖）
+- **节点复制与拖拽增强**：复制行为更完整、拖拽交互更稳（配套 320 例单测覆盖）
 
 ### MCP 接入（AI 直接调用与唤醒，0.4.0 新增）
 
@@ -74,7 +85,12 @@
 
 在 WorkBuddy 中接入（两种形态，任选其一）：
 
-**形态 A · 开发 / 未重打包（当前可用）**：桥接用项目内文件，`NOVELFLOW_GUI_EXE`
+> 安装路径以实际为准：NSIS 为用户级安装（`perMachine: false`），默认在
+> `%LOCALAPPDATA%\Programs\小说时间线工坊\`（即
+> `C:\Users\<你>\AppData\Local\Programs\小说时间线工坊\`），安装时可自选目录；
+> 主程序为 `小说时间线工坊.exe`。下例按默认路径书写，自行替换。
+
+**形态 A · 开发 / 未重打包（项目目录可用时作备份）**：桥接用项目内文件，`NOVELFLOW_GUI_EXE`
 指向安装版 exe：
 
 ```json
@@ -85,7 +101,7 @@
       "command": "C:\\Program Files\\nodejs\\node.exe",
       "args": ["D:\\小说\\AI流程图绘制小说时间线的电脑软件\\electron\\mcp\\standalone.cjs"],
       "env": {
-        "NOVELFLOW_GUI_EXE": "C:\\Program Files\\novelflow-studio\\小说时间线工坊.exe"
+        "NOVELFLOW_GUI_EXE": "C:\\Users\\<你>\\AppData\\Local\\Programs\\小说时间线工坊\\小说时间线工坊.exe"
       }
     }
   }
@@ -97,7 +113,7 @@
 > `"args": ["-e", "require('<安装目录>/mcp/standalone.cjs').main()"]`
 > （依赖宿主环境不带 `ELECTRON_RUN_AS_NODE` 时不成立，故仅作备选）。
 
-**形态 B · 正式安装版（随 GitHub Release 发布，推荐）**：`package.json` 的
+**形态 B · 正式安装版 0.4.1 起（推荐）**：`package.json` 的
 `extraFiles` 会把整个 `electron/mcp/` 投放为安装目录下的 `mcp/`（纯 Node 读不了
 asar，桥接文件必须在 asar 之外）。发布走 GitHub Actions——推送 `v*` 标签即自动
 构建（见文末「发版流程」），**从 0.4.1 起**安装目录带 `mcp/`，配置简化为：
@@ -108,7 +124,7 @@ asar，桥接文件必须在 asar 之外）。发布走 GitHub Actions——推�
     "novelflow": {
       "type": "stdio",
       "command": "C:\\Program Files\\nodejs\\node.exe",
-      "args": ["C:\\Program Files\\novelflow-studio\\mcp\\standalone.cjs"]
+      "args": ["C:\\Users\\<你>\\AppData\\Local\\Programs\\小说时间线工坊\\mcp\\standalone.cjs"]
     }
   }
 }
@@ -154,20 +170,24 @@ npm run dev                  # http://127.0.0.1:5173
 > 正式发布不走本地 pack，而是推送 `v*` 标签由 GitHub Actions 云端构建（见文末「发版流程」）。
 
 > 密钥配置：浏览器开发态在 `.env.local` 里填 `GRSAI_API_KEY`（已在 .gitignore 中）；
-> 桌面版直接在应用内设置（右上角钥匙图标 / 模型管理弹窗），无需环境变量。
+> 桌面版直接在应用内设置（左下角控制中心 → AI 生图密钥 / AI 模型管理），无需环境变量。
 
 ### Electron 桌面壳
 
 ```
 electron/
   main.cjs           窗口 · grsai 代理接管 · 自动更新 · AI 模型管理与请求代发 ·
+                      系统托盘（关闭隐藏 / 托盘退出）/ 启动最大化 / 应用图标 ·
                       单例锁（让位实例早退，不污染 control.json）与 GUI 侧控制服务器调度
+  assets/             app-icon.png（运行时窗口图标 256²）· tray-icon.png（托盘图标 32²）
   preload.cjs        contextBridge 最小安全面（更新 / AI / MCP IPC）
   control-server.cjs GUI 实例本地控制服务器（127.0.0.1 + Bearer token + 心跳刷新）
   mcp/               MCP stdio 桥：protocol（JSON-RPC 帧）· tools（26 工具注册表）·
                       control-client（HTTP 客户端）· wake（唤醒）· server（stdio 组装）·
                       standalone（独立桥接进程入口，打包态生产通路；经 extraFiles
                       投放为安装目录下的 mcp/）
+scripts/             图标生成脚本（generate-tray-icon / generate-app-icon，零依赖幂等）
+build/icon.png       应用图标源图 1024²（electron-builder 默认 buildResources，打包自动拾取）
 ```
 
 主进程职责：加载 Vite 构建产物；打包后没有 dev server，由主进程 `webRequest`
@@ -180,13 +200,14 @@ electron/
 
 ```
 ┌──────────────────────────────────────────────┐
-│ AppHeader   品牌 · 故事线（可改名）· 统计 · AI · 更新 │
+│ AppHeader   品牌 · 故事线（可改名）· 统计 · 导出 │
 ├────────┬─────────────────────────────────────┤
 │ 侧栏    │ CanvasToolbar  撤销/整理/缩放/锁定    │
 │ 故事线  ├─────────────────────────────────────┤
 │ 列表    │ FlowCanvas     自研 SVG 画布          │
 │ 搜索    │                 + 时间轨 / 缩略图     │
 └────────┴─────────────────────────────────────┘
+┌ 控制中心（左下角，侧栏折叠时降级为浮标）→ 设置中心弹窗 ┐
 ```
 
 ## 交互
@@ -237,7 +258,7 @@ src/
   stores/            useFlowStore（图数据）· useUiStore（界面偏好）· useAiStore（AI 模型）
   composables/       useViewport / useNodeDrag / useSelection / useShortcuts / useAiAssist
   components/
-    layout/           AppShell · AppHeader
+    layout/           AppShell · AppHeader · ControlCenter（控制中心 / 设置中心弹窗）
     sidebar/          FlowSidebar · FlowListItem
     canvas/           FlowCanvas · CanvasGrid · TimeRail · EdgeLayer
                       StoryNode · NodeHandles · SelectionBox · Minimap

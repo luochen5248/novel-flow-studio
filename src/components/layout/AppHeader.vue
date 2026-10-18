@@ -3,19 +3,9 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { useFlowStore } from '@/stores/useFlowStore'
 import { useUiStore } from '@/stores/useUiStore'
 import ExportMenu from '@/components/toolbar/ExportMenu.vue'
-import UpdateDialog from '@/components/common/UpdateDialog.vue'
-import GrsaiKeyDialog from '@/components/common/GrsaiKeyDialog.vue'
-import AiModelDialog from '@/components/common/AiModelDialog.vue'
 
 const store = useFlowStore()
 const ui = useUiStore()
-
-/** 仅 Electron 桌面环境显示「检查更新」入口（浏览器里走不了 electron-updater） */
-const isDesktop = !!(window as unknown as { electronAPI?: unknown }).electronAPI
-const updateDialog = ref<InstanceType<typeof UpdateDialog> | null>(null)
-const keyDialog = ref<InstanceType<typeof GrsaiKeyDialog> | null>(null)
-/** AI 模型管理：统一的 LLM + 生图入口（含内置 grsai） */
-const modelDialog = ref<InstanceType<typeof AiModelDialog> | null>(null)
 
 const editing = ref(false)
 const draft = ref('')
@@ -94,91 +84,7 @@ const doneCount = computed(() => store.nodes.filter((n) => n.status === 'done').
       <span v-if="store.lastMessage" class="nf-header__flash">{{ store.lastMessage }}</span>
 
       <ExportMenu v-if="store.activeGraph" :graph="store.activeGraph" />
-
-      <button
-        v-if="isDesktop"
-        class="nf-header__icon"
-        title="检查更新（从 GitHub 拉取最新版本并自动安装）"
-        @click="updateDialog?.open()"
-      >
-        <svg viewBox="0 0 16 16" width="16" height="16">
-          <path d="M8 2.6 V9.4 M8 9.4 L5.2 6.6 M8 9.4 L10.8 6.6 M3 11.2 V12.6 A0.8 0.8 0 0 0 3.8 13.4 H12.2 A0.8 0.8 0 0 0 13 12.6 V11.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
-        </svg>
-      </button>
-
-      <button
-        v-if="isDesktop"
-        class="nf-header__icon"
-        title="AI 生图密钥设置（grsai，仅保存在本机）"
-        @click="keyDialog?.open()"
-      >
-        <svg viewBox="0 0 16 16" width="16" height="16">
-          <circle cx="5.4" cy="8" r="2.4" fill="none" stroke="currentColor" stroke-width="1.3" />
-          <path d="M7.8 8 H13.4 M11.4 8 V10.2 M13 8 V9.6" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-        </svg>
-      </button>
-
-      <button
-        v-if="isDesktop"
-        class="nf-header__icon"
-        title="AI 模型管理（文本 / 生图，密钥只存在本机）"
-        @click="modelDialog?.open()"
-      >
-        <svg viewBox="0 0 16 16" width="16" height="16">
-          <circle cx="8" cy="8" r="2.1" fill="none" stroke="currentColor" stroke-width="1.3" />
-          <circle cx="3.4" cy="4.2" r="1.5" fill="none" stroke="currentColor" stroke-width="1.2" />
-          <circle cx="12.6" cy="4.2" r="1.5" fill="none" stroke="currentColor" stroke-width="1.2" />
-          <circle cx="4.6" cy="12.4" r="1.5" fill="none" stroke="currentColor" stroke-width="1.2" />
-          <path
-            d="M4.7 5.1 L6.4 6.7 M11.3 5.1 L9.6 6.7 M5.5 11.3 L6.8 9.6"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.2"
-            stroke-linecap="round"
-          />
-        </svg>
-      </button>
-
-      <button
-        class="nf-header__icon"
-        :class="{ 'is-on': ui.devConsoleOpen }"
-        title="开发者 / AI 控制台（window.NovelFlow 全部方法）"
-        @click="ui.toggleDevConsole()"
-      >
-        <svg viewBox="0 0 16 16" width="16" height="16">
-          <path d="M5.6 4.4 L3.4 8 L5.6 11.6 M10.4 4.4 L12.6 8 L10.4 11.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
-        </svg>
-      </button>
-
-      <button
-        class="nf-header__mode"
-        :title="ui.canvasTheme === 'dark' ? '画布切到宣纸暖白' : '画布切到夜航深色'"
-        @click="ui.toggleCanvasMode()"
-      >
-        <svg v-if="ui.canvasTheme === 'dark'" viewBox="0 0 16 16" width="15" height="15">
-          <path d="M12.6 9.8 A5.2 5.2 0 0 1 6.2 3.4 A5.4 5.4 0 1 0 12.6 9.8 Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
-        </svg>
-        <svg v-else viewBox="0 0 16 16" width="15" height="15">
-          <circle cx="8" cy="8" r="3.2" fill="none" stroke="currentColor" stroke-width="1.3" />
-          <path d="M8 1.8 V3.2 M8 12.8 V14.2 M1.8 8 H3.2 M12.8 8 H14.2 M3.6 3.6 L4.6 4.6 M11.4 11.4 L12.4 12.4 M12.4 3.6 L11.4 4.6 M4.6 11.4 L3.6 12.4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-        </svg>
-        <span>{{ ui.canvasTheme === 'dark' ? '夜航' : '宣纸' }}</span>
-      </button>
-
-      <button
-        class="nf-header__icon"
-        :title="ui.shellTheme === 'dark' ? '外壳切到浅色' : '外壳切到深色'"
-        @click="ui.toggleTheme()"
-      >
-        <svg viewBox="0 0 16 16" width="16" height="16">
-          <path d="M8 2.4 A5.6 5.6 0 1 0 8 13.6 A4.4 4.4 0 0 1 8 2.4 Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
-        </svg>
-      </button>
     </div>
-
-    <UpdateDialog ref="updateDialog" />
-    <GrsaiKeyDialog ref="keyDialog" />
-    <AiModelDialog ref="modelDialog" />
   </header>
 </template>
 
@@ -212,12 +118,6 @@ const doneCount = computed(() => store.nodes.filter((n) => n.status === 'done').
   color: var(--nf-teal);
   background: rgba(77, 208, 217, 0.1);
 }
-.nf-header__icon.is-on {
-  color: var(--nf-teal);
-  background: rgba(77, 208, 217, 0.16);
-  box-shadow: inset 0 0 0 1px rgba(77, 208, 217, 0.32);
-}
-
 .nf-header__brand {
   display: flex;
   align-items: baseline;
@@ -309,31 +209,5 @@ const doneCount = computed(() => store.nodes.filter((n) => n.status === 'done').
   border-radius: var(--nf-r-chip);
   background: rgba(77, 208, 217, 0.1);
   animation: nf-fade-in var(--nf-dur) var(--nf-ease) both;
-}
-
-/* 画布双模式切换：明显的两态胶囊（暗色外壳常驻，切换的是画布宣纸 / 夜航） */
-.nf-header__mode {
-  appearance: none;
-  border: 1px solid var(--nf-shell-line);
-  background: var(--nf-shell-700);
-  color: var(--nf-on-dark-soft);
-  height: 30px;
-  padding: 0 11px;
-  border-radius: 999px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
-  font-size: var(--nf-fs-xs);
-  letter-spacing: 0.04em;
-  transition:
-    color var(--nf-dur-fast) var(--nf-ease),
-    border-color var(--nf-dur-fast) var(--nf-ease),
-    background var(--nf-dur-fast) var(--nf-ease);
-}
-.nf-header__mode:hover {
-  color: var(--nf-teal);
-  border-color: rgba(77, 208, 217, 0.4);
-  background: rgba(77, 208, 217, 0.08);
 }
 </style>
