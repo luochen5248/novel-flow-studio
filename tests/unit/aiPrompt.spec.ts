@@ -648,3 +648,79 @@ describe('AI_PROVIDER_PRESETS / findPreset · 供应商预设', () => {
     expect(AI_PROVIDER_PRESETS.every((p) => p.label.length > 0)).toBe(true)
   })
 })
+
+/* ================================================================== */
+/* 十二、buildAssistPrompt · kb 扩展回归（memory / kbContext / docContext） */
+/* ================================================================== */
+
+describe('buildAssistPrompt · kb 扩展回归（memory/kbContext/docContext）', () => {
+  const memory = '## 作者记忆\n- 偏好：喜欢短句'
+  const kbContext = '## 知识库参考\n- 《雨夜诀别》[人物]（标签：主角）'
+  const docContext = '## 写作依据（文档锚点）\n- 《大纲.md》相关段落：断桥上的灯'
+
+  it('memory 为 undefined 与空串时，system 与现状逐字节一致（空块回归安全）', () => {
+    for (const mode of ['research', 'continue', 'polish'] as const) {
+      const base = buildAssistPrompt(NODE, { mode })[0].content
+      expect(buildAssistPrompt(NODE, { mode, memory: '' })[0].content).toBe(base)
+      expect(buildAssistPrompt(NODE, { mode })[0].content).toBe(base)
+    }
+  })
+
+  it('三个块都插在「光标选中的片段」之前，且顺序 memory→kb→doc', () => {
+    const [, userMsg] = buildAssistPrompt(NODE, {
+      mode: 'continue',
+      memory,
+      kbContext,
+      docContext,
+      selection: '他握紧了伞。'
+    })
+    const user = userMsg.content
+    const selAt = user.indexOf('## 光标选中的片段')
+    expect(user.indexOf(kbContext)).toBeGreaterThan(-1)
+    expect(user.indexOf(docContext)).toBeGreaterThan(-1)
+    expect(user.indexOf(kbContext)).toBeLessThan(selAt)
+    expect(user.indexOf(docContext)).toBeLessThan(selAt)
+    expect(user.indexOf(kbContext)).toBeLessThan(user.indexOf(docContext))
+  })
+
+  it('memory 块进 system 位；注入不改变 research 模式行为', () => {
+    const [systemMsg, userMsg] = buildAssistPrompt(NODE, {
+      mode: 'research',
+      webSearch: false,
+      memory,
+      kbContext,
+      docContext
+    })
+    expect(systemMsg.content).toContain('## 作者记忆')
+    expect(systemMsg.content).toContain('没有联网检索能力')
+    expect(userMsg.content.indexOf(kbContext)).toBeGreaterThan(-1)
+    expect(userMsg.content.indexOf(docContext)).toBeGreaterThan(-1)
+  })
+
+  it('注入后回归线仍成立：continue/polish 模式 system 与 user 均不含「检索」「联网」，注入也不引入', () => {
+    for (const mode of ['continue', 'polish'] as const) {
+      const [systemMsg, userMsg] = buildAssistPrompt(NODE, {
+        mode,
+        memory,
+        kbContext,
+        docContext
+      })
+      expect(systemMsg.content).not.toContain('检索')
+      expect(systemMsg.content).not.toContain('联网')
+      expect(userMsg.content).not.toContain('检索')
+      expect(userMsg.content).not.toContain('联网')
+    }
+  })
+
+  it('空 kbContext / docContext 不插入空块（仅 memory 生效）', () => {
+    const [systemMsg, userMsg] = buildAssistPrompt(NODE, {
+      mode: 'continue',
+      memory,
+      kbContext: '',
+      docContext: ''
+    })
+    expect(systemMsg.content).toContain('## 作者记忆')
+    expect(userMsg.content).not.toContain('## 知识库参考')
+    expect(userMsg.content).not.toContain('## 写作依据（文档锚点）')
+  })
+})

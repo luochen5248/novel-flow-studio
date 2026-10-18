@@ -14,9 +14,15 @@
  *
  * 约定：本文件为 CommonJS（.cjs），与 package.json 的 "type": "module" 隔离，避免 ESM 坑。
  */
-const { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, session } = require('electron')
+const { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, session, dialog } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
+
+// 知识库数据库（sql.js）与 .docx 纯文本抽取：只被 GUI 实例使用
+// （initKbStore 内部对 MCP_MODE 有注释性守卫；store.cjs 顶层不碰 sql.js，
+//  真正 require('sql.js') 发生在 initKbStore 里，桥接实例零成本）
+const kbStore = require('./kb/store.cjs')
+const { extractDocxText } = require('./kb/docx.cjs')
 
 /** grsai 真实 API 地址（与 vite.config.ts 的代理 target 保持同源） */
 const GRSAI_TARGET = 'https://grsai.dakka.com.cn'
@@ -1171,6 +1177,475 @@ ipcMain.handle('ai:image', async (_event, req) => {
 })
 
 /* ------------------------------------------------------------------ */
+/* 知识库（kb:*）：sql.js 本机数据库的唯一 IPC 面                          */
+/*                                                                     */
+/* 形状照 ai:*：前置校验（参数形状 / 长度上限 / 必填）→ 失败中文 error；  */
+/* async 包 try/catch；IPC 边界永不抛异常（渲染层 kbClient 再按          */
+/* result.ok === false 抛）。安全面最小化：只暴露 list/get/create/       */
+/* update/remove/link/unlink/search/export/import + doc 系列 + 偏好读写； */
+/* 不暴露 db 路径、export() 原始字节、任意 SQL。                          */
+/* ------------------------------------------------------------------ */
+
+/** 文档大小上限：10MB（再大的文档应拆篇；sql.js 是全量导出式持久化） */
+const KB_DOC_MAX_BYTES = 10 * 1024 * 1024
+/** 偏好键白名单（与渲染层 PrefKey 一一对应） */
+const KB_PREF_KEYS = ['pref.chat_memory', 'pref.local_memory', 'pref.work_background']
+
+/**
+ * kb:* 统一包装：handler 内抛出的任何异常都归一成 {ok:false, error}，
+ * 与 aiClient 的「IPC 边界永不抛」契约对齐。
+ */
+function kbHandle(channel, handler) {
+  ipcMain.handle(channel, async (event, payload) => {
+    try {
+      return await handler(payload)
+    } catch (err) {
+      // 全 || 链：?? 与 || 混用必须加括号，这里统一用 ||（空 message 也会落到下一级）
+      return { ok: false, error: err?.message || String(err) || '知识库操作失败' }
+    }
+  })
+}
+
+/** 字符串校验小工具：通过返回 null，失败返回中文 error（照 tools.cjs 迷你校验器风格） */
+function kbCheckString(value, key, { required = false, max = 200, oneOf = null } = {}) {
+  if (value === undefined || value === null || value === '') {
+    return required ? `参数「${key}」不能为空` : null
+  }
+  if (typeof value !== 'string') return `参数「${key}」必须是字符串`
+  if (value.length > max) return `参数「${key}」过长（上限 ${max} 字符）`
+  if (oneOf && !oneOf.includes(value)) return `参数「${key}」只能是：${oneOf.join(' / ')}`
+  return null
+}
+
+/** 标签数组校验：元素全字符串、条数 / 单项长度上限 */
+function kbCheckTags(value, key) {
+  if (value === undefined || value === null) return null
+  if (!Array.isArray(value)) return `参数「${key}」必须是字符串数组`
+  if (value.some((t) => typeof t !== 'string')) return `参数「${key}」必须全部是字符串`
+  if (value.length > 20) return `参数「${key}」条数过多（上限 20 个）`
+  if (value.some((t) => t.length > 50)) return `参数「${key}」单项过长（上限 50 字符）`
+  return null
+}
+
+/** 布尔校验（严格布尔，不接受 truthy 字符串） */
+function kbCheckBoolean(value, key) {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'boolean') return `参数「${key}」必须是布尔值`
+  return null
+}
+
+/* ---- 知识条目 ---- */
+
+kbHandle('kb:list-entries', () => ({ ok: true, entries: kbStore.kbListEntries() }))
+
+kbHandle('kb:create-entry', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const errs = [
+    kbCheckString(p.title, 'title', { required: true, max: 200 }),
+    kbCheckString(p.type, 'type', { max: 50, oneOf: kbStore.ENTRY_TYPES }),
+    kbCheckString(p.content, 'content', { max: 200000 }),
+    kbCheckTags(p.tags, 'tags')
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  return {
+    ok: true,
+    entry: kbStore.kbCreateEntry({
+      title: p.title.trim(),
+      type: p.type ?? 'note',
+      content: p.content ?? '',
+      tags: Array.isArray(p.tags) ? p.tags.map((t) => t.trim()).filter(Boolean) : []
+    })
+  }
+})
+
+kbHandle('kb:update-entry', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const idErr = kbCheckString(p.id, 'id', { required: true, max: 100 })
+  if (idErr) return { ok: false, error: idErr }
+  const patch = p.patch && typeof p.patch === 'object' ? p.patch : {}
+  const errs = [
+    kbCheckString(patch.title, 'title', { max: 200 }),
+    kbCheckString(patch.type, 'type', { max: 50, oneOf: kbStore.ENTRY_TYPES }),
+    kbCheckString(patch.content, 'content', { max: 200000 }),
+    kbCheckTags(patch.tags, 'tags')
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  const entry = kbStore.kbUpdateEntry(p.id, patch)
+  if (!entry) return { ok: false, error: '条目不存在或已被删除' }
+  return { ok: true, entry }
+})
+
+kbHandle('kb:remove-entry', (payload) => {
+  const idErr = kbCheckString(payload?.id, 'id', { required: true, max: 100 })
+  if (idErr) return { ok: false, error: idErr }
+  kbStore.kbRemoveEntry(payload.id)
+  return { ok: true }
+})
+
+kbHandle('kb:search-entries', (payload) => {
+  const query = typeof payload === 'string' ? payload : payload?.query
+  const err = kbCheckString(query, 'query', { max: 200 })
+  if (err) return { ok: false, error: err }
+  const limit = Number.isFinite(payload?.limit) ? Math.min(Math.max(1, payload.limit), 100) : 50
+  return { ok: true, entries: kbStore.kbSearchEntries(query ?? '', limit) }
+})
+
+/* ---- 节点关联（按 nodeId 反查 / 挂载 / 解绑） ---- */
+
+kbHandle('kb:list-node-links', (payload) => {
+  const nodeErr = kbCheckString(payload?.nodeId, 'nodeId', { required: true, max: 100 })
+  if (nodeErr) return { ok: false, error: nodeErr }
+  const { entries, docs } = kbStore.kbListNodeLinks(payload.nodeId)
+  return { ok: true, entries, docs }
+})
+
+kbHandle('kb:link-entry', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const errs = [
+    kbCheckString(p.entryId, 'entryId', { required: true, max: 100 }),
+    kbCheckString(p.nodeId, 'nodeId', { required: true, max: 100 })
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  if (!kbStore.kbGetEntry(p.entryId)) return { ok: false, error: '知识条目不存在，无法关联' }
+  kbStore.kbLinkEntry(p.entryId, p.nodeId)
+  return { ok: true }
+})
+
+kbHandle('kb:unlink-entry', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const errs = [
+    kbCheckString(p.entryId, 'entryId', { required: true, max: 100 }),
+    kbCheckString(p.nodeId, 'nodeId', { required: true, max: 100 })
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  kbStore.kbUnlinkEntry(p.entryId, p.nodeId)
+  return { ok: true }
+})
+
+kbHandle('kb:link-doc', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const errs = [
+    kbCheckString(p.docId, 'docId', { required: true, max: 100 }),
+    kbCheckString(p.nodeId, 'nodeId', { required: true, max: 100 })
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  if (!kbStore.kbGetDoc(p.docId)) return { ok: false, error: '文档不存在，无法关联' }
+  kbStore.kbLinkDoc(p.docId, p.nodeId)
+  return { ok: true }
+})
+
+kbHandle('kb:unlink-doc', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const errs = [
+    kbCheckString(p.docId, 'docId', { required: true, max: 100 }),
+    kbCheckString(p.nodeId, 'nodeId', { required: true, max: 100 })
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  kbStore.kbUnlinkDoc(p.docId, p.nodeId)
+  return { ok: true }
+})
+
+/* ---- 文档 ---- */
+
+kbHandle('kb:list-docs', () => ({ ok: true, docs: kbStore.kbListDocs() }))
+
+kbHandle('kb:get-doc', (payload) => {
+  const idErr = kbCheckString(payload?.id, 'id', { required: true, max: 100 })
+  if (idErr) return { ok: false, error: idErr }
+  const doc = kbStore.kbGetDoc(payload.id)
+  if (!doc) return { ok: false, error: '文档不存在或已被删除' }
+  return { ok: true, doc }
+})
+
+kbHandle('kb:create-doc', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const errs = [
+    kbCheckString(p.title, 'title', { required: true, max: 200 }),
+    kbCheckString(p.format, 'format', { required: true, max: 10, oneOf: kbStore.DOC_FORMATS }),
+    kbCheckString(p.content, 'content', { required: true, max: 2000000 })
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  return {
+    ok: true,
+    doc: kbStore.kbCreateDoc({ title: p.title.trim(), format: p.format, content: p.content })
+  }
+})
+
+kbHandle('kb:update-doc', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const idErr = kbCheckString(p.id, 'id', { required: true, max: 100 })
+  if (idErr) return { ok: false, error: idErr }
+  const patch = p.patch && typeof p.patch === 'object' ? p.patch : {}
+  const errs = [
+    kbCheckString(patch.title, 'title', { max: 200 }),
+    kbCheckString(patch.content, 'content', { max: 2000000 })
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  const doc = kbStore.kbUpdateDoc(p.id, patch)
+  if (!doc) return { ok: false, error: '文档不存在或已被删除' }
+  return { ok: true, doc }
+})
+
+kbHandle('kb:remove-doc', (payload) => {
+  const idErr = kbCheckString(payload?.id, 'id', { required: true, max: 100 })
+  if (idErr) return { ok: false, error: idErr }
+  kbStore.kbRemoveDoc(payload.id)
+  return { ok: true }
+})
+
+/**
+ * 选择文档（两段式第一段）：只回路径，内容走 kb:read-doc 单独读。
+ * 理由：大内容过 IPC 前先校验后缀与大小，错误信息才对用户有意义。
+ */
+kbHandle('kb:pick-doc', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择要导入的文档',
+    properties: ['openFile'],
+    filters: [{ name: '文档', extensions: ['md', 'txt', 'docx'] }]
+  })
+  if (result.canceled || !result.filePaths?.[0]) return { ok: true, canceled: true }
+  return { ok: true, canceled: false, path: result.filePaths[0] }
+})
+
+/** 读取文档内容（两段式第二段）：后缀白名单 + 10MB 上限 + 防目录穿越 */
+kbHandle('kb:read-doc', (payload) => {
+  const raw = typeof payload === 'string' ? payload : payload?.path
+  const pathErr = kbCheckString(raw, 'path', { required: true, max: 1000 })
+  if (pathErr) return { ok: false, error: pathErr }
+  // 防目录穿越双保险：显式拒掉 .. 段（dialog 已限定目录，这里是纵深防御）
+  if (raw.includes('..')) return { ok: false, error: '文件路径不合法（包含 .. 目录段）' }
+  const resolved = path.resolve(raw)
+  const ext = path.extname(resolved).toLowerCase()
+  if (!['.md', '.txt', '.docx'].includes(ext)) {
+    return { ok: false, error: '只支持 .md / .txt / .docx 三种格式' }
+  }
+  let stat
+  try {
+    stat = fs.statSync(resolved)
+  } catch {
+    return { ok: false, error: '文件不存在或无法读取' }
+  }
+  if (!stat.isFile()) return { ok: false, error: '选中的不是文件' }
+  if (stat.size > KB_DOC_MAX_BYTES) {
+    return { ok: false, error: `文件过大（上限 ${Math.floor(KB_DOC_MAX_BYTES / 1024 / 1024)}MB），请拆分成更小的文档` }
+  }
+  const format = ext.slice(1)
+  const title = path.basename(resolved, ext)
+  if (format === 'docx') {
+    return { ok: true, title, format, content: extractDocxText(fs.readFileSync(resolved)) }
+  }
+  // utf-8 读取：剥 BOM（\uFEFF 会让锚点偏移量整体 +1）+ \r\n 归一
+  // （存储内容的偏移量与 relocateAnchor 的归一化前提保持一致）
+  const content = fs.readFileSync(resolved, 'utf-8').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n')
+  return { ok: true, title, format, content }
+})
+
+/* ---- 文档锚点 ---- */
+
+kbHandle('kb:list-anchors', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const docErr = kbCheckString(p.docId, 'docId', { max: 100 })
+  const nodeErr = kbCheckString(p.nodeId, 'nodeId', { max: 100 })
+  if (docErr || nodeErr) return { ok: false, error: docErr ?? nodeErr ?? '' }
+  if (!p.docId && !p.nodeId) return { ok: false, error: '参数「docId」与「nodeId」至少给一个' }
+  const anchors = p.docId ? kbStore.kbListAnchorsByDoc(p.docId) : kbStore.kbListAnchorsByNode(p.nodeId)
+  return { ok: true, anchors }
+})
+
+kbHandle('kb:create-anchor', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const errs = [
+    kbCheckString(p.docId, 'docId', { required: true, max: 100 }),
+    kbCheckString(p.nodeId, 'nodeId', { max: 100 }),
+    kbCheckString(p.quote, 'quote', { required: true, max: 2000 }),
+    kbCheckString(p.note, 'note', { max: 500 })
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  if (!Number.isFinite(p.startOffset) || !Number.isFinite(p.endOffset)) {
+    return { ok: false, error: '参数「startOffset / endOffset」必须是数字' }
+  }
+  if (p.startOffset < 0 || p.endOffset <= p.startOffset) {
+    return { ok: false, error: '锚点区间不合法（endOffset 必须大于 startOffset）' }
+  }
+  if (!kbStore.kbGetDoc(p.docId)) return { ok: false, error: '文档不存在，无法建锚点' }
+  return {
+    ok: true,
+    anchor: kbStore.kbCreateAnchor({
+      docId: p.docId,
+      nodeId: p.nodeId ?? null,
+      quote: p.quote,
+      startOffset: Math.trunc(p.startOffset),
+      endOffset: Math.trunc(p.endOffset),
+      note: p.note ?? ''
+    })
+  }
+})
+
+kbHandle('kb:update-anchor', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const idErr = kbCheckString(p.id, 'id', { required: true, max: 100 })
+  if (idErr) return { ok: false, error: idErr }
+  const patch = p.patch && typeof p.patch === 'object' ? p.patch : {}
+  const errs = [
+    kbCheckString(patch.quote, 'quote', { max: 2000 }),
+    kbCheckString(patch.note, 'note', { max: 500 })
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  const anchor = kbStore.kbUpdateAnchor(p.id, patch)
+  if (!anchor) return { ok: false, error: '锚点不存在或已被删除' }
+  return { ok: true, anchor }
+})
+
+kbHandle('kb:remove-anchor', (payload) => {
+  const idErr = kbCheckString(payload?.id, 'id', { required: true, max: 100 })
+  if (idErr) return { ok: false, error: idErr }
+  kbStore.kbRemoveAnchor(payload.id)
+  return { ok: true }
+})
+
+/* ---- 作者记忆 ---- */
+
+kbHandle('kb:list-memories', () => ({ ok: true, memories: kbStore.kbListMemories() }))
+
+kbHandle('kb:create-memory', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const errs = [
+    kbCheckString(p.type, 'type', { required: true, max: 50, oneOf: kbStore.MEMORY_TYPES }),
+    kbCheckString(p.content, 'content', { required: true, max: 2000 }),
+    kbCheckString(p.source, 'source', { max: 50, oneOf: kbStore.MEMORY_SOURCES }),
+    kbCheckBoolean(p.pinned, 'pinned')
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  return {
+    ok: true,
+    memory: kbStore.kbCreateMemory({
+      type: p.type,
+      content: p.content.trim(),
+      source: p.source ?? 'manual',
+      pinned: p.pinned === true
+    })
+  }
+})
+
+kbHandle('kb:update-memory', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const idErr = kbCheckString(p.id, 'id', { required: true, max: 100 })
+  if (idErr) return { ok: false, error: idErr }
+  const patch = p.patch && typeof p.patch === 'object' ? p.patch : {}
+  const errs = [
+    kbCheckString(patch.type, 'type', { max: 50, oneOf: kbStore.MEMORY_TYPES }),
+    kbCheckString(patch.content, 'content', { max: 2000 }),
+    kbCheckBoolean(patch.pinned, 'pinned')
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  const memory = kbStore.kbUpdateMemory(p.id, patch)
+  if (!memory) return { ok: false, error: '记忆不存在或已被删除' }
+  return { ok: true, memory }
+})
+
+kbHandle('kb:remove-memory', (payload) => {
+  const idErr = kbCheckString(payload?.id, 'id', { required: true, max: 100 })
+  if (idErr) return { ok: false, error: idErr }
+  kbStore.kbRemoveMemory(payload.id)
+  return { ok: true }
+})
+
+kbHandle('kb:reset-memories', () => {
+  kbStore.kbResetMemories()
+  return { ok: true }
+})
+
+kbHandle('kb:export-memories', () => {
+  const memories = kbStore.kbListMemories()
+  return {
+    ok: true,
+    json: JSON.stringify({ kind: 'novelflow.kb.memories', version: 1, memories }, null, 2)
+  }
+})
+
+kbHandle('kb:import-memories', (payload) => {
+  const jsonErr = kbCheckString(payload?.json, 'json', { required: true, max: 5000000 })
+  if (jsonErr) return { ok: false, error: jsonErr }
+  let data
+  try {
+    data = JSON.parse(payload.json)
+  } catch {
+    return { ok: false, error: '导入内容不是合法 JSON' }
+  }
+  const list = Array.isArray(data) ? data : data?.memories
+  if (!Array.isArray(list)) return { ok: false, error: '导入内容里找不到记忆数组' }
+  let imported = 0
+  for (const raw of list) {
+    if (!raw || typeof raw !== 'object') continue
+    if (typeof raw.content !== 'string' || !raw.content.trim()) continue
+    kbStore.kbCreateMemory({
+      type: kbStore.MEMORY_TYPES.includes(raw.type) ? raw.type : 'fact',
+      content: raw.content.trim().slice(0, 2000),
+      source: kbStore.MEMORY_SOURCES.includes(raw.source) ? raw.source : 'manual',
+      pinned: raw.pinned === true
+    })
+    imported += 1
+  }
+  return { ok: true, imported }
+})
+
+/* ---- 偏好 ---- */
+
+kbHandle('kb:get-preferences', () => ({ ok: true, preferences: kbStore.kbGetPreferences() }))
+
+kbHandle('kb:set-preference', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const keyErr = kbCheckString(p.key, 'key', { required: true, max: 100, oneOf: KB_PREF_KEYS })
+  if (keyErr) return { ok: false, error: keyErr }
+  const valueErr = kbCheckString(p.value, 'value', { required: true, max: 20000 })
+  if (valueErr) return { ok: false, error: valueErr }
+  // 两个开关只接受 'true' / 'false'（工作背景是自由长文本）
+  if (p.key !== 'pref.work_background' && p.value !== 'true' && p.value !== 'false') {
+    return { ok: false, error: '开关值只能是 true / false' }
+  }
+  kbStore.kbSetPreference(p.key, p.value)
+  return { ok: true }
+})
+
+/* ---- 工作过程事件 ---- */
+
+kbHandle('kb:list-events', (payload) => {
+  const limit = Number.isFinite(payload?.limit) ? Math.min(Math.max(1, payload.limit), 500) : 100
+  return { ok: true, events: kbStore.kbListEvents(limit) }
+})
+
+kbHandle('kb:log-event', (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const errs = [
+    kbCheckString(p.kind, 'kind', { required: true, max: 50 }),
+    kbCheckString(p.refId, 'refId', { max: 100 }),
+    kbCheckString(p.summary, 'summary', { required: true, max: 200 })
+  ].filter(Boolean)
+  if (errs.length) return { ok: false, error: errs[0] }
+  kbStore.kbLogEvent(p.kind, p.refId ?? null, p.summary)
+  return { ok: true }
+})
+
+kbHandle('kb:curate', () => ({ ok: true, report: kbStore.kbCurateEvents() }))
+
+/* ---- 全量导出 / 导入 ---- */
+
+kbHandle('kb:export-all', () => ({ ok: true, json: kbStore.kbExportAll() }))
+
+kbHandle('kb:import-all', (payload) => {
+  const jsonErr = kbCheckString(payload?.json, 'json', { required: true, max: 50000000 })
+  if (jsonErr) return { ok: false, error: jsonErr }
+  let data
+  try {
+    data = JSON.parse(payload.json)
+  } catch {
+    return { ok: false, error: '导入内容不是合法 JSON' }
+  }
+  const counts = kbStore.kbImportAll(data)
+  return { ok: true, ...counts }
+})
+
+/* ------------------------------------------------------------------ */
 /* MCP：stdio 桥接实例（--mcp）与 GUI 实例的本地控制服务器                            */
 /* ------------------------------------------------------------------ */
 
@@ -1294,6 +1769,8 @@ app.on('second-instance', () => {
 // 所有退出路径的公共前哨：越早置位越好，保证上面那些 close 拦截不会被卡住
 app.on('before-quit', () => {
   app.isQuitting = true
+  // 第三处强制 flush（before-quit / session-end / quit 三处全覆盖）
+  flushKbSafe()
 })
 
 // Windows 关机 / 注销 / 重启：系统发的是 WM_QUERYENDSESSION，不一定走 before-quit，
@@ -1301,7 +1778,22 @@ app.on('before-quit', () => {
 // 所以把这条当作 before-quit 之外的第二道放行闸。
 app.on('session-end', () => {
   app.isQuitting = true
+  // 关机放行闸 = 最后的安全网：db 此刻必须落盘（session-end 不一定还有后续 quit）
+  flushKbSafe()
 })
+
+/**
+ * 知识库强制落盘（退出路径专用）。
+ * sql.js 是全量导出式持久化，防抖窗口里没来得及写的内容靠这里补；
+ * 落盘失败（磁盘满等）只记日志，绝不禁退出流程。
+ */
+function flushKbSafe() {
+  try {
+    kbStore.flushNow()
+  } catch (err) {
+    console.error('[kb] 强制落盘失败：', err?.message ?? String(err))
+  }
+}
 
 app.whenReady().then(() => {
   if (MCP_MODE) {
@@ -1319,6 +1811,12 @@ app.whenReady().then(() => {
   setupGrsaiProxy()
   setupAutoUpdater()
   createWindow()
+  // 知识库数据库（sql.js）：只挂 GUI 分支 —— MCP_MODE 桥接实例在上面已早退，
+  // 它是个无窗口 stdio 进程，不碰业务数据。初始化失败不阻塞窗口：
+  // 面板打开时会再见到错误提示，主界面照常可用。
+  void kbStore.initKbStore().catch((err) =>
+    console.error('[kb] 数据库初始化失败：', err?.message ?? String(err))
+  )
   startControlServer()
 
   app.on('activate', () => {
@@ -1328,6 +1826,8 @@ app.whenReady().then(() => {
 })
 
 app.on('quit', () => {
+  // 数据安全第一：先 flush 知识库，再停控制服务器 / 销毁托盘
+  flushKbSafe()
   stopControlServer()
   // 必须显式 destroy：不销毁的话部分 Windows 环境里进程退出后托盘图标会残留在通知区，
   // 要等鼠标划过才消失。destroy 本身可能抛（托盘已被系统回收），不能让它挡住退出流程。

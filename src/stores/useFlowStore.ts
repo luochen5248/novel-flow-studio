@@ -18,6 +18,8 @@ import { history } from '@/core/history'
 import { loadWorkspace, saveWorkspace } from '@/core/storage'
 import { createSampleGraph } from '@/core/sample'
 import { useUiStore } from './useUiStore'
+// 工作过程事件（task-002）：结构性动作完成后各记一条，供「记忆与进化」沉淀
+import { useKbStore } from './useKbStore'
 
 export interface WriteOptions {
   /** true ⇒ 不产生历史记录（拖拽过程中由调用方在起点手动 commit 一次） */
@@ -48,6 +50,21 @@ function affectsHeight(patch: Partial<StoryNode>): boolean {
 }
 
 const PERSIST_DELAY = 260
+
+/* ---------------- 工作过程事件（task-002） ----------------
+ * 结构性动作（新建/复制/删除图、增删节点、连线、整理布局…）完成后各记一条。
+ * 为什么不在 persist() 里记：拖拽的静默更新也走 persist，会把事件表灌成噪音；
+ * 为什么经 useKbStore.logWorkEvent 而非直接 kbClient：「本地记忆与技能」
+ * 开关（默认关）的判定与浏览器态 no-op 都由那边收口，这里只管触发。
+ * 失败一律静默：事件是附属品，绝不阻断画布主链。 */
+function logWork(kind: string, refId: string | null, summary: string): void {
+  try {
+    const kb = useKbStore()
+    void kb.logWorkEvent(kind, refId, summary)
+  } catch {
+    /* pinia 未就绪等异常：吞掉 */
+  }
+}
 
 /**
  * 图数据主 store。
@@ -208,6 +225,7 @@ export const useFlowStore = defineStore('flow', () => {
     workspace.value.activeId = g.id
     resetHistory()
     persist()
+    logWork('graph_create', g.id, `新建故事线「${g.name}」`)
     return g
   }
 
@@ -235,16 +253,20 @@ export const useFlowStore = defineStore('flow', () => {
     workspace.value.activeId = copy.id
     resetHistory()
     persist()
+    logWork('graph_duplicate', copy.id, `复制故事线「${g.name}」`)
     return copy
   }
 
   function removeGraph(id: string): void {
     const idx = graphs.value.findIndex((x) => x.id === id)
     if (idx < 0) return
+    // 先取名字再删：删完就无从提及是哪条线了
+    const removed = graphs.value[idx]
     workspace.value.graphs.splice(idx, 1)
     ensureActive()
     resetHistory()
     persist()
+    logWork('graph_remove', id, `删除故事线「${removed.name}」`)
   }
 
   function setActiveGraph(id: string): void {
@@ -272,6 +294,7 @@ export const useFlowStore = defineStore('flow', () => {
     workspace.value.activeId = g.id
     resetHistory()
     persist()
+    logWork('graph_import', g.id, `导入故事线「${g.name}」`)
     return g
   }
 
@@ -295,6 +318,8 @@ export const useFlowStore = defineStore('flow', () => {
     touch(g)
     selectedIds.value = [node.id]
     persist()
+    // silent = 拖拽/批处理路径的静默写：不进历史也不进事件表（同口径）
+    if (!opts.silent) logWork('node_add', node.id, `新增节点「${node.title}」`)
     return node
   }
 
@@ -319,6 +344,8 @@ export const useFlowStore = defineStore('flow', () => {
     const g = requireGraph()
     if (!g) return
     if (!opts.silent) commit('删除节点')
+    // 先取标题再删：事件摘要要说清删的是哪个节点
+    const removed = g.nodes.find((n) => n.id === id)
     g.nodes = g.nodes.filter((n) => n.id !== id)
     g.edges = g.edges.filter((e) => e.source !== id && e.target !== id)
     selectedIds.value = selectedIds.value.filter((x) => x !== id)
@@ -326,6 +353,7 @@ export const useFlowStore = defineStore('flow', () => {
     if (g.settings.layoutMode === 'timeline') layoutTimeline(g)
     touch(g)
     persist()
+    if (!opts.silent) logWork('node_remove', id, `删除节点「${removed?.title ?? id}」`)
   }
 
   function duplicateNode(id: string): StoryNode | null {
@@ -360,6 +388,7 @@ export const useFlowStore = defineStore('flow', () => {
     touch(g)
     selectedIds.value = [copy.id]
     persist()
+    logWork('node_duplicate', copy.id, `复制节点「${src.title}」`)
     return copy
   }
 
@@ -383,6 +412,7 @@ export const useFlowStore = defineStore('flow', () => {
     touch(g)
     selectedIds.value = [node.id]
     persist()
+    logWork('node_insert', node.id, `在「${anchor.title}」下方插入节点`)
     return node
   }
 
@@ -407,6 +437,7 @@ export const useFlowStore = defineStore('flow', () => {
     touch(g)
     selectedIds.value = [node.id]
     persist()
+    logWork('node_insert', node.id, `在「${anchor.title}」上方插入节点`)
     return node
   }
 
@@ -432,6 +463,7 @@ export const useFlowStore = defineStore('flow', () => {
     touch(g)
     selectedIds.value = [node.id]
     persist()
+    logWork('node_insert', node.id, `从「${anchor.title}」拉出分支节点`)
     return node
   }
 
@@ -461,6 +493,10 @@ export const useFlowStore = defineStore('flow', () => {
     g.edges.push(edge)
     touch(g)
     persist()
+    // 摘要带上两端标题：事件流里能直接读懂「谁连到了谁」
+    const from = g.nodes.find((n) => n.id === sourceId)?.title ?? sourceId
+    const to = g.nodes.find((n) => n.id === targetId)?.title ?? targetId
+    logWork('edge_connect', edge.id, `连线「${from}」→「${to}」`)
     return edge
   }
 
@@ -472,6 +508,7 @@ export const useFlowStore = defineStore('flow', () => {
     clearStaleEdgeSelection()
     touch(g)
     persist()
+    if (!opts.silent) logWork('edge_remove', id, '删除连线')
   }
 
   function updateEdge(id: string, patch: Partial<StoryEdge>): void {
@@ -535,6 +572,7 @@ export const useFlowStore = defineStore('flow', () => {
     touch(g)
     selectedIds.value = [node.id]
     persist()
+    logWork('node_insert', node.id, `在连线中插入节点「${node.title}」`)
     return node
   }
 
@@ -621,6 +659,7 @@ export const useFlowStore = defineStore('flow', () => {
     commit('整理布局')
     tidyUp(g)
     persist()
+    logWork('layout_tidy', null, '一键整理布局')
   }
 
   function relayout(): void {
@@ -628,6 +667,7 @@ export const useFlowStore = defineStore('flow', () => {
     if (!g) return
     layoutTimeline(g)
     persist()
+    logWork('layout', null, '重跑时间线布局')
   }
 
   /* ---------------- 选择 ---------------- */

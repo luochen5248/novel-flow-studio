@@ -26,6 +26,45 @@ import {
   toMermaid,
   toSvgString
 } from '@/export'
+// 知识库 / 文档 / 记忆：渲染层唯一出口（桌面态 IPC、浏览器态 IDB 分流，kbClient 内部处理）
+import {
+  createAnchor,
+  createDoc,
+  createEntry,
+  createMemory,
+  getDoc,
+  linkDoc,
+  linkEntry,
+  listDocs,
+  listEntries,
+  listLinksForNode,
+  listMemories,
+  removeDoc,
+  removeEntry,
+  removeMemory,
+  searchEntries,
+  unlinkDoc,
+  unlinkEntry,
+  updateDoc,
+  updateEntry,
+  updateMemory
+} from './kbClient'
+// 锚点模糊重定位：docAnchor 用 quote 在文档内容里现定位偏移量（与 UI 划词建锚点同一算法）
+import { relocateAnchor } from '@/core/kb/anchor'
+import type {
+  CreateDocInput,
+  CreateEntryInput,
+  CreateMemoryInput,
+  DocAnchor,
+  KbDocument,
+  KnowledgeEntry,
+  KnowledgeType,
+  MemoryEntry,
+  NodeLinks,
+  UpdateDocInput,
+  UpdateEntryInput,
+  UpdateMemoryInput
+} from '@/core/kb/types'
 
 /**
  * ==================================================================
@@ -197,6 +236,41 @@ export interface NovelFlowApi {
   batch(commands: Array<[string, ...unknown[]]>): ApiResult<ApiResult[]>
   subscribe(cb: (graph: FlowGraph) => void): () => void
   help(): ApiResult<HelpItem[]>
+
+  /* ---------------- 知识库 / 文档 / 记忆（task-002） ----------------
+   * 与图方法不同：这些能力的状态在主进程 sql.js / 浏览器态 IDB，
+   * 因此全部是异步的（kbClient 的 Promise 直通，纪律同样是永不抛异常）。 */
+
+  kbAddEntry(input: CreateEntryInput): Promise<ApiResult<KnowledgeEntry>>
+  kbUpdateEntry(id: string, patch: UpdateEntryInput): Promise<ApiResult<KnowledgeEntry>>
+  kbRemoveEntry(id: string): Promise<ApiResult<boolean>>
+  kbListEntries(type?: KnowledgeType): Promise<ApiResult<KnowledgeEntry[]>>
+  kbSearch(query: string): Promise<ApiResult<KnowledgeEntry[]>>
+  kbLinkNode(entryId: string, nodeId: string): Promise<ApiResult<boolean>>
+  kbUnlinkNode(entryId: string, nodeId: string): Promise<ApiResult<boolean>>
+  kbListNodeLinks(nodeId: string): Promise<ApiResult<NodeLinks>>
+
+  docAdd(input: CreateDocInput): Promise<ApiResult<KbDocument>>
+  docList(): Promise<ApiResult<KbDocument[]>>
+  docGet(id: string): Promise<ApiResult<KbDocument | null>>
+  docUpdate(id: string, patch: UpdateDocInput): Promise<ApiResult<KbDocument>>
+  docRemove(id: string): Promise<ApiResult<boolean>>
+  /** 文档锚点：quote 经 relocateAnchor 模糊重定位后入库；定位不到返回中文错误 */
+  docAnchor(input: {
+    docId: string
+    quote: string
+    /** 大致字符偏移量（可选，辅助精确定位） */
+    hint?: number
+    nodeId?: string
+    note?: string
+  }): Promise<ApiResult<DocAnchor>>
+  docLinkNode(docId: string, nodeId: string): Promise<ApiResult<boolean>>
+  docUnlinkNode(docId: string, nodeId: string): Promise<ApiResult<boolean>>
+
+  memoryAdd(input: CreateMemoryInput): Promise<ApiResult<MemoryEntry>>
+  memoryList(): Promise<ApiResult<MemoryEntry[]>>
+  memoryUpdate(id: string, patch: UpdateMemoryInput): Promise<ApiResult<MemoryEntry>>
+  memoryRemove(id: string): Promise<ApiResult<boolean>>
 }
 
 /* ------------------------------------------------------------------ */
@@ -1127,6 +1201,257 @@ function reset(): ApiResult<FlowGraph> {
   })
 }
 
+/* ------------------------------------------------------------------ */
+/* 知识库 / 文档 / 记忆（task-002）                                      */
+/*                                                                    */
+/* 与图操作不同：kb 的全部状态在主进程 sql.js（桌面）/ IndexedDB        */
+/* （浏览器），本模块只做「参数兜底 + 调 kbClient + 归一 ApiResult」，   */
+/* 纪律与图方法一致：永不抛异常到调用方。                               */
+/* ------------------------------------------------------------------ */
+
+/** kbClient 的统一包装：它抛出的中文错误 → {ok:false, error} */
+async function kbCall<T>(fn: () => Promise<T>): Promise<ApiResult<T>> {
+  try {
+    return ok(await fn())
+  } catch (e) {
+    return fail(errMessage(e))
+  }
+}
+
+/** 标签兜底：只收字符串、去空白、限 50 个（与 kbClient / MCP 层同口径） */
+function safeTags(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out = raw
+    .filter((t): t is string => typeof t === 'string')
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .slice(0, 50)
+  return out
+}
+
+async function kbAddEntry(input: CreateEntryInput): Promise<ApiResult<KnowledgeEntry>> {
+  const title = String(input?.title ?? '').trim()
+  if (!title) return fail('kbAddEntry 失败：条目标题不能为空')
+  const tags = safeTags(input?.tags)
+  return kbCall(() =>
+    createEntry({
+      title,
+      ...(input?.type ? { type: input.type } : {}),
+      ...(input?.content !== undefined ? { content: String(input.content) } : {}),
+      ...(tags ? { tags } : {})
+    })
+  )
+}
+
+async function kbUpdateEntry(id: string, patch: UpdateEntryInput): Promise<ApiResult<KnowledgeEntry>> {
+  const key = String(id ?? '').trim()
+  if (!key) return fail('kbUpdateEntry 失败：id 不能为空')
+  if (!patch || typeof patch !== 'object') return fail('kbUpdateEntry 失败：patch 必须是对象')
+  const tags = safeTags(patch.tags)
+  // 下面按已知键显式构造 safe：控制台直调时多带的键（含 id）天然被剥掉
+  const safe: UpdateEntryInput = {
+    ...(patch.title !== undefined ? { title: String(patch.title) } : {}),
+    ...(patch.type ? { type: patch.type } : {}),
+    ...(patch.content !== undefined ? { content: String(patch.content) } : {}),
+    ...(tags ? { tags } : {})
+  }
+  try {
+    const entry = await updateEntry(key, safe)
+    if (!entry) return fail(`kbUpdateEntry 失败：找不到条目 ${key}`)
+    return ok(entry)
+  } catch (e) {
+    return fail(`kbUpdateEntry 失败：${errMessage(e)}`)
+  }
+}
+
+async function kbRemoveEntry(id: string): Promise<ApiResult<boolean>> {
+  const key = String(id ?? '').trim()
+  if (!key) return fail('kbRemoveEntry 失败：id 不能为空')
+  return kbCall(() => removeEntry(key))
+}
+
+async function kbListEntries(type?: KnowledgeType): Promise<ApiResult<KnowledgeEntry[]>> {
+  return kbCall(async () => {
+    const all = await listEntries()
+    return type ? all.filter((e) => e.type === type) : all
+  })
+}
+
+async function kbSearch(query: string): Promise<ApiResult<KnowledgeEntry[]>> {
+  const q = String(query ?? '').trim()
+  if (!q) return fail('kbSearch 失败：关键词不能为空')
+  return kbCall(() => searchEntries(q))
+}
+
+async function kbLinkNode(entryId: string, nodeId: string): Promise<ApiResult<boolean>> {
+  const e = String(entryId ?? '').trim()
+  const n = String(nodeId ?? '').trim()
+  if (!e || !n) return fail('kbLinkNode 失败：entryId 与 nodeId 都不能为空')
+  return kbCall(() => linkEntry(e, n))
+}
+
+async function kbUnlinkNode(entryId: string, nodeId: string): Promise<ApiResult<boolean>> {
+  const e = String(entryId ?? '').trim()
+  const n = String(nodeId ?? '').trim()
+  if (!e || !n) return fail('kbUnlinkNode 失败：entryId 与 nodeId 都不能为空')
+  return kbCall(() => unlinkEntry(e, n))
+}
+
+async function kbListNodeLinks(nodeId: string): Promise<ApiResult<NodeLinks>> {
+  const n = String(nodeId ?? '').trim()
+  if (!n) return fail('kbListNodeLinks 失败：nodeId 不能为空')
+  return kbCall(() => listLinksForNode(n))
+}
+
+async function docAdd(input: CreateDocInput): Promise<ApiResult<KbDocument>> {
+  const title = String(input?.title ?? '').trim()
+  if (!title) return fail('docAdd 失败：文档标题不能为空')
+  const content = String(input?.content ?? '')
+  if (!content.trim()) return fail('docAdd 失败：文档内容不能为空')
+  return kbCall(() =>
+    createDoc({
+      title,
+      format: input?.format ?? 'md',
+      content
+    })
+  )
+}
+
+async function docList(): Promise<ApiResult<KbDocument[]>> {
+  return kbCall(() => listDocs())
+}
+
+async function docGet(id: string): Promise<ApiResult<KbDocument | null>> {
+  const key = String(id ?? '').trim()
+  if (!key) return fail('docGet 失败：id 不能为空')
+  return kbCall(() => getDoc(key))
+}
+
+async function docUpdate(id: string, patch: UpdateDocInput): Promise<ApiResult<KbDocument>> {
+  const key = String(id ?? '').trim()
+  if (!key) return fail('docUpdate 失败：id 不能为空')
+  if (!patch || typeof patch !== 'object') return fail('docUpdate 失败：patch 必须是对象')
+  // 按已知键显式构造：id 与 format 不可改（format 决定解析口径，
+  // 改了会让已存锚点的偏移量失效）；控制台直调多带的键天然被剥掉
+  const safe: UpdateDocInput = {
+    ...(patch.title !== undefined ? { title: String(patch.title) } : {}),
+    ...(patch.content !== undefined ? { content: String(patch.content) } : {})
+  }
+  try {
+    const doc = await updateDoc(key, safe)
+    if (!doc) return fail(`docUpdate 失败：找不到文档 ${key}`)
+    return ok(doc)
+  } catch (e) {
+    return fail(`docUpdate 失败：${errMessage(e)}`)
+  }
+}
+
+async function docRemove(id: string): Promise<ApiResult<boolean>> {
+  const key = String(id ?? '').trim()
+  if (!key) return fail('docRemove 失败：id 不能为空')
+  return kbCall(() => removeDoc(key))
+}
+
+/**
+ * 文档锚点（AI 侧入口）：与 UI 划词建锚点不同，AI 只有 quote 文本，
+ * 因此先读文档全文，用 relocateAnchor 现定位偏移量再入库 ——
+ * 定位不到（confidence: 'none'）返回中文错误，绝不存错位锚点。
+ */
+async function docAnchor(input: {
+  docId: string
+  quote: string
+  hint?: number
+  nodeId?: string
+  note?: string
+}): Promise<ApiResult<DocAnchor>> {
+  const docId = String(input?.docId ?? '').trim()
+  const quote = String(input?.quote ?? '').trim()
+  if (!docId) return fail('docAnchor 失败：docId 不能为空')
+  if (!quote) return fail('docAnchor 失败：quote 不能为空')
+  try {
+    const doc = await getDoc(docId)
+    if (!doc) return fail(`docAnchor 失败：找不到文档 ${docId}`)
+    const content = doc.content ?? ''
+    // hint 是单点偏移量：扩展成 [hint, hint + quote.length] 的窗口供模糊匹配
+    const hintWindow =
+      typeof input.hint === 'number' && Number.isFinite(input.hint)
+        ? { startOffset: Math.max(0, Math.trunc(input.hint)), endOffset: Math.max(0, Math.trunc(input.hint)) + quote.length }
+        : null
+    const hit = relocateAnchor(content, quote, hintWindow)
+    if (hit.confidence === 'none') {
+      return fail('docAnchor 失败：在文档里定位不到这段文字——请确认 quote 与文档内容一致（可附 hint 偏移量）')
+    }
+    const anchor = await createAnchor({
+      docId,
+      quote,
+      startOffset: hit.start,
+      endOffset: hit.end,
+      ...(input.nodeId ? { nodeId: String(input.nodeId) } : {}),
+      ...(input.note ? { note: String(input.note) } : {})
+    })
+    return ok(anchor)
+  } catch (e) {
+    return fail(`docAnchor 失败：${errMessage(e)}`)
+  }
+}
+
+async function docLinkNode(docId: string, nodeId: string): Promise<ApiResult<boolean>> {
+  const d = String(docId ?? '').trim()
+  const n = String(nodeId ?? '').trim()
+  if (!d || !n) return fail('docLinkNode 失败：docId 与 nodeId 都不能为空')
+  return kbCall(() => linkDoc(d, n))
+}
+
+async function docUnlinkNode(docId: string, nodeId: string): Promise<ApiResult<boolean>> {
+  const d = String(docId ?? '').trim()
+  const n = String(nodeId ?? '').trim()
+  if (!d || !n) return fail('docUnlinkNode 失败：docId 与 nodeId 都不能为空')
+  return kbCall(() => unlinkDoc(d, n))
+}
+
+async function memoryAdd(input: CreateMemoryInput): Promise<ApiResult<MemoryEntry>> {
+  const content = String(input?.content ?? '').trim()
+  if (!content) return fail('memoryAdd 失败：记忆内容不能为空')
+  return kbCall(() =>
+    createMemory({
+      type: input?.type ?? 'preference',
+      content,
+      // AI 侧新增统一记 manual：来源语义由界面转存（assist）与整理升格（auto）区分
+      ...(input?.source ? { source: input.source } : {}),
+      ...(input?.pinned !== undefined ? { pinned: !!input.pinned } : {})
+    })
+  )
+}
+
+async function memoryList(): Promise<ApiResult<MemoryEntry[]>> {
+  return kbCall(() => listMemories())
+}
+
+async function memoryUpdate(id: string, patch: UpdateMemoryInput): Promise<ApiResult<MemoryEntry>> {
+  const key = String(id ?? '').trim()
+  if (!key) return fail('memoryUpdate 失败：id 不能为空')
+  if (!patch || typeof patch !== 'object') return fail('memoryUpdate 失败：patch 必须是对象')
+  // 按已知键显式构造 safe：id 不可改；控制台直调多带的键天然被剥掉
+  const safe: UpdateMemoryInput = {
+    ...(patch.type ? { type: patch.type } : {}),
+    ...(patch.content !== undefined ? { content: String(patch.content) } : {}),
+    ...(patch.pinned !== undefined ? { pinned: !!patch.pinned } : {})
+  }
+  try {
+    const m = await updateMemory(key, safe)
+    if (!m) return fail(`memoryUpdate 失败：找不到记忆 ${key}`)
+    return ok(m)
+  } catch (e) {
+    return fail(`memoryUpdate 失败：${errMessage(e)}`)
+  }
+}
+
+async function memoryRemove(id: string): Promise<ApiResult<boolean>> {
+  const key = String(id ?? '').trim()
+  if (!key) return fail('memoryRemove 失败：id 不能为空')
+  return kbCall(() => removeMemory(key))
+}
+
 /* ---- 批量 ---- */
 
 /**
@@ -1203,7 +1528,27 @@ const HELP_LIST: HelpItem[] = [
   { name: 'reset', signature: 'reset()', desc: '清空当前故事线的全部节点与连线，可 undo 恢复' },
   { name: 'batch', signature: 'batch([[name, ...args], ...])', desc: '顺序执行多条命令，单条失败不中断，收集全部结果' },
   { name: 'subscribe', signature: 'subscribe(cb)', desc: '订阅状态变更（防抖 120ms），返回取消订阅函数' },
-  { name: 'help', signature: 'help()', desc: '返回本清单' }
+  { name: 'help', signature: 'help()', desc: '返回本清单' },
+  { name: 'kbAddEntry', signature: 'kbAddEntry({title, type?, content?, tags?})', desc: '新建知识条目（note / setting / character / plot / style）' },
+  { name: 'kbUpdateEntry', signature: 'kbUpdateEntry(id, patch)', desc: '更新知识条目（id 不可改）' },
+  { name: 'kbRemoveEntry', signature: 'kbRemoveEntry(id)', desc: '删除知识条目（连带解除节点关联）' },
+  { name: 'kbListEntries', signature: 'kbListEntries(type?)', desc: '列出知识条目（可按类型过滤，列表不带正文）' },
+  { name: 'kbSearch', signature: 'kbSearch(query)', desc: '搜索知识条目（标题 / 标签 / 正文加权 + 时间衰减）' },
+  { name: 'kbLinkNode', signature: 'kbLinkNode(entryId, nodeId)', desc: '把知识条目关联到节点（写故事时可被检索注入）' },
+  { name: 'kbUnlinkNode', signature: 'kbUnlinkNode(entryId, nodeId)', desc: '解除知识条目与节点的关联' },
+  { name: 'kbListNodeLinks', signature: 'kbListNodeLinks(nodeId)', desc: '反查节点关联的全部知识条目与文档' },
+  { name: 'docAdd', signature: 'docAdd({title, format?, content})', desc: '新建文档（md / txt / docx 纯文本直接入库）' },
+  { name: 'docList', signature: 'docList()', desc: '列出全部文档（不含正文）' },
+  { name: 'docGet', signature: 'docGet(id)', desc: '读取文档全文（含 content）' },
+  { name: 'docUpdate', signature: 'docUpdate(id, patch)', desc: '更新文档标题或正文（id 与 format 不可改）' },
+  { name: 'docRemove', signature: 'docRemove(id)', desc: '删除文档（连带删除锚点与节点关联）' },
+  { name: 'docAnchor', signature: 'docAnchor({docId, quote, hint?, nodeId?, note?})', desc: '把文档里的一段文字建成锚点（自动模糊重定位），可同时关联节点' },
+  { name: 'docLinkNode', signature: 'docLinkNode(docId, nodeId)', desc: '把整篇文档关联到节点' },
+  { name: 'docUnlinkNode', signature: 'docUnlinkNode(docId, nodeId)', desc: '解除文档与节点的关联' },
+  { name: 'memoryAdd', signature: 'memoryAdd({type?, content, pinned?})', desc: '新增作者记忆（preference / fact / decision / background）' },
+  { name: 'memoryList', signature: 'memoryList()', desc: '列出全部作者记忆' },
+  { name: 'memoryUpdate', signature: 'memoryUpdate(id, patch)', desc: '更新记忆（id 不可改）' },
+  { name: 'memoryRemove', signature: 'memoryRemove(id)', desc: '删除一条作者记忆' }
 ]
 
 function help(): ApiResult<HelpItem[]> {
@@ -1258,7 +1603,27 @@ export const api: NovelFlowApi = {
   reset,
   batch,
   subscribe,
-  help
+  help,
+  kbAddEntry,
+  kbUpdateEntry,
+  kbRemoveEntry,
+  kbListEntries,
+  kbSearch,
+  kbLinkNode,
+  kbUnlinkNode,
+  kbListNodeLinks,
+  docAdd,
+  docList,
+  docGet,
+  docUpdate,
+  docRemove,
+  docAnchor,
+  docLinkNode,
+  docUnlinkNode,
+  memoryAdd,
+  memoryList,
+  memoryUpdate,
+  memoryRemove
 }
 
 declare global {

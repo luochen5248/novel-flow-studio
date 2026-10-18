@@ -6,6 +6,9 @@
  *  - 密钥相关：读写 grsai 密钥（存 userData/config.json，不进 git、不进 exe）
  *  - AI 相关：模型增删改查 / 测连 / 对话（含流式与取消）/ 生图；
  *    密钥与真实端点都留在主进程，这里只透传方法调用。
+ *  - 知识库相关：条目 / 节点关联 / 文档 / 锚点 / 记忆 / 偏好 / 事件 /
+ *    全量导入导出（userData/novelflow.db，sql.js）；只透传方法调用，
+ *    不暴露 db 路径、export() 原始字节与任意 SQL。
  * 其余 Node 能力一律不暴露。
  */
 const { contextBridge, ipcRenderer } = require('electron')
@@ -53,6 +56,54 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.on('ai:chunk', listener)
       return () => ipcRenderer.removeListener('ai:chunk', listener)
     }
+  },
+
+  /* ---- 知识库 / 文档 / 记忆（userData/novelflow.db，sql.js）---- */
+  kb: {
+    /** 知识条目 */
+    listEntries: () => ipcRenderer.invoke('kb:list-entries'),
+    createEntry: (input) => ipcRenderer.invoke('kb:create-entry', input),
+    updateEntry: (id, patch) => ipcRenderer.invoke('kb:update-entry', { id, patch }),
+    removeEntry: (id) => ipcRenderer.invoke('kb:remove-entry', { id }),
+    searchEntries: (query) => ipcRenderer.invoke('kb:search-entries', { query }),
+    /** 节点关联：按 nodeId 反查 / 挂载 / 解绑（事实源在 db，节点上不存镜像字段） */
+    listLinksForNode: (nodeId) => ipcRenderer.invoke('kb:list-node-links', { nodeId }),
+    linkEntry: (entryId, nodeId) => ipcRenderer.invoke('kb:link-entry', { entryId, nodeId }),
+    unlinkEntry: (entryId, nodeId) => ipcRenderer.invoke('kb:unlink-entry', { entryId, nodeId }),
+    linkDoc: (docId, nodeId) => ipcRenderer.invoke('kb:link-doc', { docId, nodeId }),
+    unlinkDoc: (docId, nodeId) => ipcRenderer.invoke('kb:unlink-doc', { docId, nodeId }),
+    /** 文档（列表不带 content，内容走 getDoc） */
+    listDocs: () => ipcRenderer.invoke('kb:list-docs'),
+    getDoc: (id) => ipcRenderer.invoke('kb:get-doc', { id }),
+    createDoc: (input) => ipcRenderer.invoke('kb:create-doc', input),
+    updateDoc: (id, patch) => ipcRenderer.invoke('kb:update-doc', { id, patch }),
+    removeDoc: (id) => ipcRenderer.invoke('kb:remove-doc', { id }),
+    /** 文档选择与读取（两段式：dialog 只回路径，内容单独读并校验后缀 / 大小） */
+    pickDoc: () => ipcRenderer.invoke('kb:pick-doc'),
+    readDoc: (path) => ipcRenderer.invoke('kb:read-doc', { path }),
+    /** 文档锚点 */
+    listAnchors: (filter) => ipcRenderer.invoke('kb:list-anchors', filter),
+    createAnchor: (input) => ipcRenderer.invoke('kb:create-anchor', input),
+    updateAnchor: (id, patch) => ipcRenderer.invoke('kb:update-anchor', { id, patch }),
+    removeAnchor: (id) => ipcRenderer.invoke('kb:remove-anchor', { id }),
+    /** 作者记忆 */
+    listMemories: () => ipcRenderer.invoke('kb:list-memories'),
+    createMemory: (input) => ipcRenderer.invoke('kb:create-memory', input),
+    updateMemory: (id, patch) => ipcRenderer.invoke('kb:update-memory', { id, patch }),
+    removeMemory: (id) => ipcRenderer.invoke('kb:remove-memory', { id }),
+    resetMemories: () => ipcRenderer.invoke('kb:reset-memories'),
+    exportMemories: () => ipcRenderer.invoke('kb:export-memories'),
+    importMemories: (json) => ipcRenderer.invoke('kb:import-memories', { json }),
+    /** 偏好（两个记忆开关 + 工作背景） */
+    getPreferences: () => ipcRenderer.invoke('kb:get-preferences'),
+    setPreference: (key, value) => ipcRenderer.invoke('kb:set-preference', { key, value }),
+    /** 工作过程事件 */
+    listEvents: (limit) => ipcRenderer.invoke('kb:list-events', { limit }),
+    logEvent: (kind, refId, summary) => ipcRenderer.invoke('kb:log-event', { kind, refId, summary }),
+    curate: () => ipcRenderer.invoke('kb:curate'),
+    /** 全量导入导出（JSON 备份） */
+    exportAll: () => ipcRenderer.invoke('kb:export-all'),
+    importAll: (json) => ipcRenderer.invoke('kb:import-all', { json })
   },
 
   /* ---- MCP 调用桥：主进程控制服务器 ↔ 渲染层 window.NovelFlow ---- */

@@ -143,6 +143,7 @@ function onAssist(mode: AssistMode): void {
   assistDialog.value?.open({
     mode,
     node: {
+      id: target.id,
       title: target.title,
       summary: target.summary,
       content: content.value,

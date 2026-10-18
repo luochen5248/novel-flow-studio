@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { message } from 'ant-design-vue'
 import { useAiAssist, type AiAssistRequest } from '@/composables/useAiAssist'
+import { createMemory } from '@/api/kbClient'
 import { ASSIST_MODE_LABEL, RESEARCH_DISCLAIMER } from '@/core/aiPrompt'
 
 /**
@@ -19,6 +21,13 @@ const assist = useAiAssist()
 const visible = ref(false)
 const copied = ref(false)
 const scrollBox = ref<HTMLElement | null>(null)
+/**
+ * 最近一次请求的完整上下文（open() 时置位）。
+ * 「存为记忆」要带节点标题与模式做前缀，而 useAiAssist 内部的 request 未
+ * 导出（扩暴露面反而破坏封装）—— 宿主传进来的 options 就是全量快照，
+ * 在 dialog 侧自己留一份即可，两个宿主零改动。
+ */
+const lastRequest = ref<AiAssistRequest | null>(null)
 
 /** 浮层锚点：默认贴在触发点右下，越界自动回推 */
 const pos = ref({ left: 0, top: 0 })
@@ -56,6 +65,7 @@ function clampPosition(x: number, y: number): { left: number; top: number } {
 }
 
 function open(options: OpenOptions): void {
+  lastRequest.value = options
   pos.value = clampPosition(options.x, options.y)
   visible.value = true
   copied.value = false
@@ -66,6 +76,7 @@ function close(): void {
   // 关闭即结算：还在流式就先中止，已写进编辑器的片段照常落库，不会白写
   assist.reset()
   visible.value = false
+  lastRequest.value = null
 }
 
 /** Esc 关闭：与 AiContextMenu 同一套 capture + stopPropagation 范式，且不会顺带触发抽屉 Esc（m5） */
@@ -86,6 +97,29 @@ onBeforeUnmount(() => {
 
 async function handleCopy(): Promise<void> {
   copied.value = await assist.copy()
+}
+
+/**
+ * 存为记忆：把本次 AI 结果转存成作者记忆（source: 'assist'）。
+ * 内容前缀带上模式与节点标题，事后在「控制中心 → 记忆与进化」可改类型。
+ * 主进程 content 上限 2000 字，这里先裁再发，避免长结果整条被拒。
+ */
+async function saveAsMemory(): Promise<void> {
+  const text = assist.received.value
+  if (!text) return
+  const nodeTitle = lastRequest.value?.node.title?.trim()
+  const mode = assist.mode.value
+  const prefix = nodeTitle ? `【${ASSIST_MODE_LABEL[mode]} · ${nodeTitle}】` : `【${ASSIST_MODE_LABEL[mode]}】`
+  try {
+    await createMemory({
+      type: 'preference',
+      content: `${prefix}${text.slice(0, 1900)}`,
+      source: 'assist'
+    })
+    message.success('已存为作者记忆（控制中心 → 记忆与进化 可管理）')
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : '保存记忆失败')
+  }
 }
 
 function regenerate(): void {
@@ -163,6 +197,9 @@ defineExpose({ open, close, running: assist.running })
             <span class="nf-assist__spacer" />
             <button class="nf-assist__btn" :disabled="!assist.received.value" @click="handleCopy">
               {{ copied ? '已复制' : '复制' }}
+            </button>
+            <button class="nf-assist__btn" :disabled="!assist.received.value" @click="saveAsMemory">
+              存为记忆
             </button>
             <button class="nf-assist__btn" @click="regenerate">重新生成</button>
           </template>

@@ -20,12 +20,17 @@
  * 对话框被多处挂载。
  */
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { message } from 'ant-design-vue'
 import { useUiStore } from '@/stores/useUiStore'
+import { useKbStore } from '@/stores/useKbStore'
+import { downloadText } from '@/core/storage'
+import type { MemoryEntry, MemoryType } from '@/core/kb/types'
 import UpdateDialog from '@/components/common/UpdateDialog.vue'
 import GrsaiKeyDialog from '@/components/common/GrsaiKeyDialog.vue'
 import AiModelDialog from '@/components/common/AiModelDialog.vue'
 
 const ui = useUiStore()
+const kbStore = useKbStore()
 
 /** 仅 Electron 桌面环境才显示依赖 electronAPI 的几项（浏览器里走不了主进程） */
 const isDesktop = !!(window as unknown as { electronAPI?: unknown }).electronAPI
@@ -67,6 +72,8 @@ interface SettingItem {
   /** 右栏主按钮文案 */
   actionLabel: string
   run: () => void
+  /** 右栏专属渲染分支（记忆与进化：开关 + 工作背景 + 管理区，不用标准 action 骨架） */
+  panel?: 'memory'
 }
 
 /**
@@ -89,6 +96,127 @@ function openKeyDialog(): void {
 function openUpdateDialog(): void {
   open.value = false
   updateDialog.value?.open()
+}
+
+/* ---------------- 记忆与进化（右栏专属分支的状态与动作） ---------------- */
+
+/** 记忆行内编辑：点「改」把该行换成 textarea（完整管理也在这里，面板只给快捷入口） */
+const editingMemoryId = ref('')
+const editingMemoryText = ref('')
+/** 重置要防手滑：第一次点进入待确认，第二次才真删 */
+const resetArmed = ref(false)
+const memFileInput = ref<HTMLInputElement | null>(null)
+
+const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
+  preference: '偏好',
+  fact: '事实',
+  decision: '决定',
+  background: '背景'
+}
+
+function onBackgroundInput(e: Event): void {
+  // 草稿直接进 store，保存由 store 的 800ms 防抖负责
+  kbStore.setWorkBackgroundDraft((e.target as HTMLTextAreaElement).value)
+}
+
+async function onChatMemoryChange(e: Event): Promise<void> {
+  const checked = (e.target as HTMLInputElement).checked
+  try {
+    await kbStore.setChatMemory(checked)
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '保存开关失败')
+  }
+}
+
+async function onLocalMemoryChange(e: Event): Promise<void> {
+  const checked = (e.target as HTMLInputElement).checked
+  try {
+    await kbStore.setLocalMemory(checked)
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '保存开关失败')
+  }
+}
+
+function onEditMemory(m: MemoryEntry): void {
+  editingMemoryId.value = m.id
+  editingMemoryText.value = m.content
+}
+
+function onCancelMemoryEdit(): void {
+  editingMemoryId.value = ''
+  editingMemoryText.value = ''
+}
+
+async function onSaveMemoryEdit(): Promise<void> {
+  const text = editingMemoryText.value.trim()
+  if (!text) {
+    message.warning('记忆内容不能为空')
+    return
+  }
+  try {
+    await kbStore.updateMemoryAction(editingMemoryId.value, { content: text })
+    editingMemoryId.value = ''
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '保存记忆失败')
+  }
+}
+
+async function onRemoveMemory(id: string): Promise<void> {
+  try {
+    await kbStore.removeMemoryAction(id)
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '删除记忆失败')
+  }
+}
+
+function onResetMemories(): void {
+  if (!resetArmed.value) {
+    resetArmed.value = true
+    message.info('再点一次「重置」确认清空全部记忆')
+    return
+  }
+  resetArmed.value = false
+  kbStore
+    .resetMemoriesAction()
+    .then(() => message.success('已清空全部记忆'))
+    .catch((err) => message.error(err instanceof Error ? err.message : '重置失败'))
+}
+
+async function onCurateMemories(): Promise<void> {
+  try {
+    const report = await kbStore.curate()
+    message.success(report.merged ? `整理完成：合并 ${report.merged} 条重复记忆` : '整理完成：没有发现重复记忆')
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '整理失败')
+  }
+}
+
+function onExportMemories(): void {
+  kbStore
+    .exportMemoriesAction()
+    .then((json) => {
+      downloadText('novelflow-memories.json', json)
+      message.success('已导出记忆 JSON')
+    })
+    .catch((err) => message.error(err instanceof Error ? err.message : '导出失败'))
+}
+
+function onImportMemories(): void {
+  memFileInput.value?.click()
+}
+
+async function onMemFile(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  try {
+    const imported = await kbStore.importMemoriesAction(await file.text())
+    message.success(`已导入 ${imported} 条记忆`)
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '导入失败')
+  } finally {
+    input.value = ''
+  }
 }
 
 const items = computed<SettingItem[]>(() => {
@@ -174,6 +302,42 @@ const items = computed<SettingItem[]>(() => {
     )
   }
 
+  // 知识库 + 记忆与进化两组。浏览器态走 IndexedDB 降层也能用面板 CRUD，
+  // 故不做 isDesktop 门控（与上面三项依赖主进程的不同）。
+  // 「浏览知识库」照 openModelDialog 惯例：先关自己再开大面板（900 档，
+  // 与本弹窗 950 不同屏）；「记忆与进化」是右栏专属渲染分支（panel: 'memory'）。
+  list.push(
+    {
+      key: 'kb',
+      group: '知识库',
+      label: '浏览知识库',
+      icon:
+        'M3.2 2.8 H10.2 L12.8 5.4 V13.2 H3.2 Z M5.6 7.4 H10 M5.6 9.8 H10 M5.6 12.2 H8',
+      title: '知识库',
+      desc: '跨故事线的作者资产：知识条目、参考文档与段落锚点。全部存在本机数据库（userData/novelflow.db），不随故事线 JSON 导出。',
+      state: kbStore.entries.length ? `已收录 ${kbStore.entries.length} 条知识` : '还没有条目',
+      actionLabel: '打开知识库',
+      run: () => {
+        open.value = false
+        kbStore.openPanel('entries')
+      }
+    },
+    {
+      key: 'memory',
+      group: '记忆与进化',
+      label: '记忆与进化',
+      icon:
+        'M8 2.6 A5.4 5.4 0 1 0 8 13.4 A4.2 4.2 0 0 1 8 2.6 Z M6.2 6.4 H9.8 M6.2 8.6 H9.8 M6.2 10.8 H8.4',
+      title: '记忆与进化',
+      desc: '两个开关默认关闭（隐私优先）；「工作背景」与「管理记忆」始终可用，不受开关控制。',
+      state: kbStore.chatMemory || kbStore.localMemory ? '有开关已开启' : '开关均关闭',
+      active: kbStore.chatMemory || kbStore.localMemory,
+      actionLabel: '',
+      panel: 'memory',
+      run: () => {}
+    }
+  )
+
   return list
 })
 
@@ -253,6 +417,8 @@ watch(open, (value) => {
   if (value) {
     // 每次打开都回到第一项，不保留上次的选中态（设置项少，回到起点更好找）
     activeKey.value = items.value[0]?.key ?? ''
+    // 知识库 / 记忆数据回拉一次（右栏状态文字与管理列表都读 store）
+    void kbStore.refresh()
     // 记下打开前聚焦的元素，关闭时还回去（通常是左下角入口按钮）
     lastFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null
     window.addEventListener('keydown', onKeydown, true)
@@ -345,16 +511,105 @@ onBeforeUnmount(() => {
             </nav>
 
             <section class="nf-cc-modal__content">
-              <h3 class="nf-cc-modal__content-title">{{ current.title }}</h3>
-              <p :id="descId" class="nf-cc-modal__desc">{{ current.desc }}</p>
-              <div class="nf-cc-modal__action">
-                <button class="nf-cc-modal__primary" @click="current.run()">
-                  {{ current.actionLabel }}
-                </button>
-                <span class="nf-cc-modal__state" :class="{ 'is-active': current.active }">
-                  {{ current.state }}
-                </span>
-              </div>
+              <!-- 记忆与进化：专属渲染分支（开关 + 工作背景 + 管理区）。
+                   列表区 max-height + 内部滚动，别把 760×500 的弹窗撑爆 -->
+              <template v-if="current.panel === 'memory'">
+                <h3 class="nf-cc-modal__content-title">记忆与进化</h3>
+                <p class="nf-cc-modal__desc">
+                  「对话记忆」打开后，AI 求助会带上下面的工作背景与作者记忆；「本地记忆与技能」打开后，软件会记录工作过程（新建节点 / 导出 / AI
+                  协助）供统计与整理。两个开关默认关闭。
+                </p>
+
+                <div class="nf-cc-mem__switches">
+                  <label class="nf-cc-mem__switch">
+                    <input
+                      type="checkbox"
+                      :checked="kbStore.chatMemory"
+                      @change="onChatMemoryChange"
+                    />
+                    <span>对话记忆（AI 求助时带上作者记忆与工作背景）</span>
+                  </label>
+                  <label class="nf-cc-mem__switch">
+                    <input
+                      type="checkbox"
+                      :checked="kbStore.localMemory"
+                      @change="onLocalMemoryChange"
+                    />
+                    <span>本地记忆与技能（记录工作过程，用于统计与整理）</span>
+                  </label>
+                </div>
+
+                <div class="nf-cc-mem__block">
+                  <label class="nf-cc-mem__label">工作背景（始终可用；自动保存，进提示词时最多 400 字）</label>
+                  <textarea
+                    class="nf-cc-mem__textarea"
+                    rows="3"
+                    placeholder="如：本书是民国背景的推理长篇，主角口癖是短句，忌讳形容词堆砌……"
+                    :value="kbStore.workBackgroundDraft"
+                    @input="onBackgroundInput"
+                  />
+                </div>
+
+                <div class="nf-cc-mem__block">
+                  <div class="nf-cc-mem__manage-head">
+                    <span class="nf-cc-mem__label">管理记忆（{{ kbStore.memories.length }} 条）</span>
+                    <span class="nf-cc-mem__manage-actions">
+                      <button class="nf-cc-mem__mini" @click="onCurateMemories">一键整理</button>
+                      <button class="nf-cc-mem__mini" @click="onExportMemories">导出</button>
+                      <button class="nf-cc-mem__mini" @click="onImportMemories">导入</button>
+                      <button
+                        class="nf-cc-mem__mini is-danger"
+                        @click="onResetMemories"
+                      >
+                        {{ resetArmed ? '确认重置？' : '重置' }}
+                      </button>
+                    </span>
+                  </div>
+                  <ul v-if="kbStore.memories.length" class="nf-cc-mem__list nf-scroll">
+                    <li v-for="m in kbStore.memories" :key="m.id" class="nf-cc-mem__item">
+                      <template v-if="editingMemoryId === m.id">
+                        <textarea
+                          v-model="editingMemoryText"
+                          class="nf-cc-mem__edit"
+                          rows="2"
+                        />
+                        <span class="nf-cc-mem__item-actions">
+                          <button class="nf-cc-mem__mini" @click="onSaveMemoryEdit">保存</button>
+                          <button class="nf-cc-mem__mini" @click="onCancelMemoryEdit">取消</button>
+                        </span>
+                      </template>
+                      <template v-else>
+                        <span class="nf-cc-mem__item-type">{{ MEMORY_TYPE_LABEL[m.type] ?? '记忆' }}</span>
+                        <span class="nf-cc-mem__item-text">{{ m.content }}</span>
+                        <span class="nf-cc-mem__item-actions">
+                          <button class="nf-cc-mem__mini" @click="onEditMemory(m)">改</button>
+                          <button class="nf-cc-mem__mini is-danger" @click="onRemoveMemory(m.id)">删</button>
+                        </span>
+                      </template>
+                    </li>
+                  </ul>
+                  <p v-else class="nf-cc-mem__empty">
+                    还没有记忆。AI 结果可在写作浮层里「存为记忆」，也可在知识库面板的记忆区快捷新建。
+                  </p>
+                </div>
+
+                <p class="nf-cc-mem__privacy">记忆内容仅保存在本机（userData/novelflow.db），可随时导出或删除。</p>
+                <input ref="memFileInput" type="file" accept=".json,application/json" hidden @change="onMemFile" />
+              </template>
+
+              <!-- 标准设置项骨架 -->
+              <template v-else>
+                <h3 class="nf-cc-modal__content-title">{{ current.title }}</h3>
+                <p :id="descId" class="nf-cc-modal__desc">{{ current.desc }}</p>
+                <div class="nf-cc-modal__action">
+                  <button class="nf-cc-modal__primary" @click="current.run()">
+                    {{ current.actionLabel }}
+                  </button>
+                  <span class="nf-cc-modal__state" :class="{ 'is-active': current.active }">
+                    {{ current.state }}
+                  </span>
+                </div>
+              </template>
             </section>
           </div>
         </div>
@@ -650,6 +905,160 @@ onBeforeUnmount(() => {
 /* 状态生效中（控制台已开）用青色点出来 */
 .nf-cc-modal__state.is-active {
   color: var(--nf-teal);
+}
+
+/* ---------- 记忆与进化（右栏专属分支） ---------- */
+/* 弹窗是 760×500：右栏整体可滚动，记忆列表再套一层 max-height + 内部滚动，
+   两级滚动分担高度，绝不把面板撑爆 */
+.nf-cc-mem__switches {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.nf-cc-mem__switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--nf-fs-sm);
+  color: var(--nf-on-dark);
+  cursor: pointer;
+}
+.nf-cc-mem__switch input {
+  accent-color: var(--nf-teal);
+}
+
+.nf-cc-mem__block {
+  margin-top: 16px;
+}
+.nf-cc-mem__label {
+  display: block;
+  font-size: var(--nf-fs-2xs);
+  letter-spacing: 0.06em;
+  color: var(--nf-on-dark-faint);
+  margin-bottom: 6px;
+}
+.nf-cc-mem__textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 64px;
+  padding: 8px 10px;
+  border-radius: var(--nf-r-ctl);
+  border: 1px solid var(--nf-shell-line);
+  background: rgba(8, 14, 19, 0.4);
+  color: var(--nf-on-dark);
+  font-size: var(--nf-fs-sm);
+  line-height: 1.7;
+}
+.nf-cc-mem__textarea:focus {
+  outline: none;
+  border-color: rgba(77, 208, 217, 0.45);
+}
+
+.nf-cc-mem__manage-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.nf-cc-mem__manage-actions {
+  display: flex;
+  gap: 6px;
+}
+.nf-cc-mem__mini {
+  appearance: none;
+  border: 1px solid var(--nf-shell-line);
+  background: rgba(8, 14, 19, 0.4);
+  color: var(--nf-on-dark-soft);
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: var(--nf-fs-2xs);
+  letter-spacing: 0.04em;
+  transition:
+    color var(--nf-dur-fast) var(--nf-ease),
+    border-color var(--nf-dur-fast) var(--nf-ease),
+    background var(--nf-dur-fast) var(--nf-ease);
+}
+.nf-cc-mem__mini:hover {
+  color: var(--nf-teal);
+  border-color: rgba(77, 208, 217, 0.42);
+}
+.nf-cc-mem__mini.is-danger:hover {
+  color: var(--nf-danger);
+  border-color: rgba(200, 106, 99, 0.42);
+}
+
+.nf-cc-mem__list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 148px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.nf-cc-mem__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: var(--nf-r-ctl);
+  background: var(--nf-shell-700);
+  border: 1px solid var(--nf-shell-line-soft);
+  font-size: var(--nf-fs-xs);
+  color: var(--nf-on-dark);
+}
+.nf-cc-mem__item-type {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--nf-teal);
+  background: rgba(77, 208, 217, 0.12);
+  border-radius: var(--nf-r-chip);
+  padding: 1px 6px;
+}
+.nf-cc-mem__item-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  line-height: 1.6;
+  /* 记忆可能很长：列表里最多三行，完整内容进编辑器看 */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.nf-cc-mem__item-actions {
+  flex: none;
+  display: flex;
+  gap: 4px;
+}
+.nf-cc-mem__edit {
+  flex: 1 1 auto;
+  resize: vertical;
+  min-height: 40px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(77, 208, 217, 0.45);
+  background: rgba(8, 14, 19, 0.5);
+  color: var(--nf-on-dark);
+  font-size: var(--nf-fs-xs);
+  line-height: 1.6;
+}
+.nf-cc-mem__empty {
+  margin: 8px 0 0;
+  font-size: var(--nf-fs-2xs);
+  line-height: 1.7;
+  color: var(--nf-on-dark-faint);
+}
+.nf-cc-mem__privacy {
+  margin: 14px 0 0;
+  font-size: var(--nf-fs-2xs);
+  letter-spacing: 0.02em;
+  color: var(--nf-on-dark-faint);
 }
 
 @keyframes nf-cc-modal-fade {

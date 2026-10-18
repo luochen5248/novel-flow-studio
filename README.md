@@ -141,15 +141,35 @@ asar，桥接文件必须在 asar 之外）。发布走 GitHub Actions——推�
 
 对 AI 说：「唤醒小说时间线工坊，新建故事线《锚点》，添加三个节点：雨夜初遇 / 旧账 / 抉择」——软件窗口自动弹出，节点上线并自动串联。
 
-工具（26 个）：`wake` / `status` / `help` / `list_flows` / `add_flow` / `open_flow` /
+工具（46 个）：`wake` / `status` / `help` / `list_flows` / `add_flow` / `open_flow` /
 `remove_flow` / `rename_flow` / `get_state` / `add_node` / `add_nodes` / `update_node` /
 `remove_node` / `add_edge` / `remove_edge` / `update_edge` / `add_note` / `add_character` /
 `add_tag` / `set_status` / `set_chapter` / `batch` / `undo` / `redo` / `export` /
-`api`（白名单内任意 NovelFlow 方法的逃生门）。资源：`novelflow://flows`、`novelflow://outline`。
+`api`（白名单内任意 NovelFlow 方法的逃生门）/ `kb_add_entry` / `kb_update_entry` /
+`kb_remove_entry` / `kb_list_entries` / `kb_search` / `kb_link_node` / `kb_unlink_node` /
+`kb_list_node_links` / `doc_add` / `doc_list` / `doc_get` / `doc_update` / `doc_remove` /
+`doc_anchor` / `doc_link_node` / `doc_unlink_node` / `memory_add` / `memory_list` /
+`memory_update` / `memory_remove`。资源：`novelflow://flows`、`novelflow://outline`。
 
 安全说明：控制服务器只绑 127.0.0.1 回环、不涉入网规则；token 为 256 位随机值，与 AI
 模型密钥同库（userData，0600）存放，请勿外传；AI 的全部操作都可 undo；`exportPNG` /
 `download` / `subscribe` 等返回二进制或有 UI 副作用的方法不在白名单内。
+
+### 知识库与记忆进化（0.5.0 新增）
+
+为长篇小说作者准备的**本机**知识库与写作依据系统，全部数据存在用户数据目录的
+`novelflow.db`（sql.js 单文件数据库，不联网、不出本机）：
+
+- **知识条目**：在左下角控制中心打开「知识库」面板，按 笔记 / 设定 / 人物 / 情节 / 风格
+  分类沉淀素材，支持标题 / 标签 / 正文搜索（LIKE 预筛 + 渲染层相关性精排）
+- **文档上传与段落锚点**：上传自己的 `.md` / `.txt` / `.docx`（docx 自动抽取纯文本）；
+  在文档查看器里划选一段文字即可**关联到当前节点**——锚点随文档改动自动模糊重定位，不会错位
+- **AI 三路注入**：右键唤起 AI 助手时，自动把「作者记忆 / 知识库参考 / 写作依据（关联
+  文档段落）」拼进提示词；记忆块仅在「本地记忆与技能」开关打开时注入（隐私优先），
+  检索失败则静默跳过，绝不阻断主链
+- **记忆与进化**：控制中心「记忆与进化」面板可沉淀写作偏好与工作背景、回顾 AI 协助
+  历史；两个开关默认关闭，打开后才记录工作过程事件
+- **MCP 暴露**：新增 20 个知识库工具（`kb_*` / `doc_*` / `memory_*`），见上方「工具（46 个）」
 
 ## 快速开始（开发）
 
@@ -182,7 +202,7 @@ electron/
   assets/             app-icon.png（运行时窗口图标 256²）· tray-icon.png（托盘图标 32²）
   preload.cjs        contextBridge 最小安全面（更新 / AI / MCP IPC）
   control-server.cjs GUI 实例本地控制服务器（127.0.0.1 + Bearer token + 心跳刷新）
-  mcp/               MCP stdio 桥：protocol（JSON-RPC 帧）· tools（26 工具注册表）·
+  mcp/               MCP stdio 桥：protocol（JSON-RPC 帧）· tools（46 工具注册表）·
                       control-client（HTTP 客户端）· wake（唤醒）· server（stdio 组装）·
                       standalone（独立桥接进程入口，打包态生产通路；经 extraFiles
                       投放为安装目录下的 mcp/）
@@ -230,6 +250,7 @@ build/icon.png       应用图标源图 1024²（electron-builder 默认 buildRe
 
 - 浏览器版：一切存在 `localStorage` 的 `novelflow.workspace.v1` 键下，自动保存（写入失败会降级并告警，不白屏）。
 - 桌面版：故事线数据同上；AI 模型配置与密钥存 `userData/config.json`，仅本机可读。
+- 知识库数据存 `userData/novelflow.db`（sql.js 单文件），含知识条目、文档、段落锚点、作者记忆与偏好；与故事线数据相互独立存储。
 - 侧栏支持单图 JSON 导入 / 导出。
 - 数据契约唯一事实源：`src/types/graph.ts`；AI 相关类型：`src/types/ai.ts`。
 
@@ -249,13 +270,13 @@ electron-builder 打包发布，产物为安装包 exe + latest.yml 更新元数
 ## 目录
 
 ```
-electron/            桌面壳（main.cjs · preload.cjs · control-server.cjs · mcp/）
+electron/            桌面壳（main.cjs · preload.cjs · control-server.cjs · mcp/ · kb/（store.cjs/docx.cjs 主进程知识库））
 src/
   types/             graph.ts 数据契约 · ai.ts AI 模型类型
-  core/              id / model / layout / geometry / history / storage / aiPrompt / characterSlot
-  api/               aiClient（AI 请求客户端）
+  core/              id / model / layout / geometry / history / storage / aiPrompt / characterSlot / kb（types/sanitize/search/anchor/inject）
+  api/               aiClient（AI 请求客户端）· kbClient（知识库客户端：桌面 IPC 与浏览器 IndexedDB 双通路）· kbIdb（浏览器态 IndexedDB 孪生）
   mcp/               rendererBridge（MCP → window.NovelFlow 渲染层调用桥）
-  stores/            useFlowStore（图数据）· useUiStore（界面偏好）· useAiStore（AI 模型）
+  stores/            useFlowStore（图数据）· useUiStore（界面偏好）· useAiStore（AI 模型）· useKbStore（知识库）
   composables/       useViewport / useNodeDrag / useSelection / useShortcuts / useAiAssist
   components/
     layout/           AppShell · AppHeader · ControlCenter（控制中心 / 设置中心弹窗）
@@ -267,6 +288,7 @@ src/
     common/           AiModelDialog · AiContextMenu · GrsaiKeyDialog
                       UpdateDialog · TagInput · ApiConsole(dev)
     inspector/        NodeInspector
+    kb/               KnowledgePanel（知识库大面板）
     story/            StoryEditorDrawer
   styles/             tokens.css（设计令牌）· global.css
 tests/

@@ -1,13 +1,24 @@
 import { computed, ref } from 'vue'
 import { chatStream, type ChatStreamHandle } from '@/api/aiClient'
+import {
+  getDoc,
+  getPreferences,
+  listAnchors,
+  listMemories,
+  searchForNode
+} from '@/api/kbClient'
 import { useAiStore } from '@/stores/useAiStore'
+import { useKbStore } from '@/stores/useKbStore'
 import {
   applyInsertion,
   buildAssistPrompt,
+  ASSIST_MODE_LABEL,
   type AssistMode,
   type AssistNeighbors,
   type AssistNodeContext
 } from '@/core/aiPrompt'
+import { buildDocBlock, buildKbBlock, buildMemoryBlock, type DocSnippetInput } from '@/core/kb/inject'
+import type { KbDocument } from '@/core/kb/types'
 
 /**
  * 编辑器右键 AI 的**编排层**：一段请求从选区到落笔的完整生命周期。
@@ -114,6 +125,16 @@ export function useAiAssist() {
     if (request) {
       const snapshot = compose()
       request.onSettled({ value: snapshot.value, caretPos: snapshot.caretPos, cancelled })
+      // 工作过程事件：一次 AI 协助记一条（kind + mode + 字数）。仅「本地记忆与
+      // 技能」开关打开才记（判定在 useKbStore.logWorkEvent 内部）；错误中断的
+      // 那次不记（received 可能是半截错误前的碎片，记了反而是噪音）。
+      if (received.value && !error.value) {
+        void useKbStore().logWorkEvent(
+          'ai_assist',
+          request.node.id ?? null,
+          `${ASSIST_MODE_LABEL[request.mode]}：${received.value.length} 字`
+        )
+      }
     }
   }
 
@@ -148,12 +169,54 @@ export function useAiAssist() {
 
     // 联网增强：默认跟随模型的 webSearch 开关
     const useSearch = next.mode === 'research' && (webSearch.value || model.webSearch === true)
+
+    // ---- 知识库三路注入（记忆 / 知识条目 / 文档锚点）----
+    // 纪律：检索失败或无结果**静默跳过**，绝不为增益功能阻断 AI 主链；
+    // 「对话记忆」开关关闭时不注入记忆块（隐私优先），知识库参考与写作依据
+    // 是显式功能不受开关限制。能走到这里 store.available 已为 true（桌面态）。
+    let memoryBlock = ''
+    let kbBlock = ''
+    let docBlock = ''
+    try {
+      const prefs = await getPreferences()
+      if (prefs['pref.chat_memory'] === 'true') {
+        // 工作背景 + top-N 记忆（pinned 优先由 listMemories 的排序保证）
+        const background = prefs['pref.work_background'] ?? ''
+        const memoryList = await listMemories()
+        memoryBlock = buildMemoryBlock(background, memoryList.slice(0, 8))
+      }
+      kbBlock = buildKbBlock(await searchForNode(next.node))
+      // 写作依据：节点关联文档的锚点段。node.id 缺省（宿主未透传，如
+      // StoryEditorDrawer）时静默跳过 —— 老调用方不传也不报错。
+      if (next.node.id) {
+        const anchors = await listAnchors({ nodeId: next.node.id })
+        if (anchors.length) {
+          const docIds = [...new Set(anchors.map((a) => a.docId))].slice(0, 3)
+          const docList = await Promise.all(docIds.map((id) => getDoc(id)))
+          const docMap = new Map(
+            docList.filter((d): d is KbDocument => !!d).map((d) => [d.id, d])
+          )
+          const snippets: DocSnippetInput[] = []
+          for (const anchor of anchors) {
+            const doc = docMap.get(anchor.docId)
+            if (doc) snippets.push({ docTitle: doc.title, content: doc.content ?? '', anchor })
+          }
+          docBlock = buildDocBlock(snippets)
+        }
+      }
+    } catch {
+      /* 知识库整体不可用：静默跳过，AI 主链不受影响 */
+    }
+
     const messages = buildAssistPrompt(next.node, {
       mode: next.mode,
       selection: next.baseText.slice(next.selection.start, next.selection.end),
       neighbors: next.neighbors,
       webSearch: useSearch,
-      instruction: next.instruction
+      instruction: next.instruction,
+      memory: memoryBlock || undefined,
+      kbContext: kbBlock || undefined,
+      docContext: docBlock || undefined
     })
 
     running.value = true

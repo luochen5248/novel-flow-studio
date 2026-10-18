@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { message } from 'ant-design-vue'
 import {
   Tabs as ATabs,
   TabPane as ATabPane,
@@ -25,6 +26,8 @@ import {
 import { useFlowStore } from '@/stores/useFlowStore'
 import { useUiStore } from '@/stores/useUiStore'
 import { useAiStore } from '@/stores/useAiStore'
+import { useKbStore } from '@/stores/useKbStore'
+import type { KnowledgeType, NodeLinks } from '@/core/kb/types'
 import TagInput from '@/components/common/TagInput.vue'
 import AiContextMenu from '@/components/common/AiContextMenu.vue'
 import AiAssistDialog from '@/components/ai/AiAssistDialog.vue'
@@ -44,6 +47,7 @@ const emit = defineEmits<{ (e: 'open-ai-image'): void }>()
 const store = useFlowStore()
 const ui = useUiStore()
 const ai = useAiStore()
+const kbStore = useKbStore()
 
 const node = computed<StoryNode | null>(() => store.currentNode)
 
@@ -51,11 +55,51 @@ const node = computed<StoryNode | null>(() => store.currentNode)
 watch(node, (next) => {
   // 切节点时先把流式任务结算到旧节点上，避免 AI 接着往新节点里写
   if (ai.streaming) assistDialog.value?.close()
-  if (next) ui.inspectorOpen = true
+  if (next) {
+    ui.inspectorOpen = true
+    // 关联区按节点反查（事实源在 db，节点上不存镜像字段）
+    void kbStore.refreshNodeLinks(next.id)
+  }
 })
 onMounted(() => {
   if (!store.currentNode) ui.inspectorOpen = true
+  else void kbStore.refreshNodeLinks(store.currentNode.id)
 })
+
+/* ---------------- 关联（知识条目 / 文档，按 nodeId 反查） ---------------- */
+
+/** 当前节点的关联数据；store 里缓存的是「哪个节点的」要一并核对，防串节点 */
+const nodeLinks = computed<NodeLinks>(() => {
+  const links = kbStore.nodeLinks
+  if (links && node.value && links.nodeId === node.value.id) return links
+  return { entries: [], docs: [] }
+})
+
+const ENTRY_TYPE_LABEL: Record<KnowledgeType, string> = {
+  note: '笔记',
+  setting: '设定',
+  character: '人物',
+  plot: '情节',
+  style: '风格'
+}
+
+function onUnlinkEntry(entryId: string): void {
+  if (!node.value) return
+  kbStore
+    .unlinkEntryAction(entryId, node.value.id)
+    .catch((e) => message.error(e instanceof Error ? e.message : '解除关联失败'))
+}
+
+function onUnlinkDoc(docId: string): void {
+  if (!node.value) return
+  kbStore
+    .unlinkDocAction(docId, node.value.id)
+    .catch((e) => message.error(e instanceof Error ? e.message : '解除关联失败'))
+}
+
+function openKbPanel(): void {
+  kbStore.openPanel('entries')
+}
 
 /* ---------------- 总览态统计 ---------------- */
 const totalNodes = computed(() => store.nodes.length)
@@ -174,6 +218,8 @@ function onAssist(mode: AssistMode): void {
   assistDialog.value?.open({
     mode,
     node: {
+      // id 供 AI 注入按节点反查关联文档锚点（useAiAssist 用；不进提示词）
+      id: current.id,
       title: current.title,
       summary: current.summary,
       content: current.content,
@@ -476,6 +522,33 @@ function addFirst(): void {
             <AButton block type="primary" class="nf-inspector__ai" @click="emit('open-ai-image')">
               <span class="nf-inspector__ai-icon">✦</span> AI 生图
             </AButton>
+          </ATabPane>
+
+          <!-- 关联：知识条目 / 文档（数据经 kbClient 按 nodeId 反查，事实源在 db） -->
+          <ATabPane key="kb" tab="关联">
+            <div class="nf-field">
+              <label class="nf-field__label">关联知识<span class="nf-field__tip">去知识库面板可挂载 / 解绑</span></label>
+              <div v-if="nodeLinks.entries.length" class="nf-kb-list">
+                <div v-for="entry in nodeLinks.entries" :key="entry.id" class="nf-kb-link">
+                  <span class="nf-kb-link__type">{{ ENTRY_TYPE_LABEL[entry.type] ?? '笔记' }}</span>
+                  <span class="nf-kb-link__title" :title="entry.title">{{ entry.title }}</span>
+                  <button class="nf-kb-link__remove" title="解除关联" @click="onUnlinkEntry(entry.id)">×</button>
+                </div>
+              </div>
+              <p v-else class="nf-kb-empty">还没有关联的知识条目</p>
+              <AButton block class="nf-inspector__write" @click="openKbPanel">浏览知识库</AButton>
+            </div>
+            <div class="nf-field">
+              <label class="nf-field__label">关联文档<span class="nf-field__tip">划词建锚点见知识库面板</span></label>
+              <div v-if="nodeLinks.docs.length" class="nf-kb-list">
+                <div v-for="doc in nodeLinks.docs" :key="doc.id" class="nf-kb-link">
+                  <span class="nf-kb-link__type">{{ doc.format.toUpperCase() }}</span>
+                  <span class="nf-kb-link__title" :title="doc.title">{{ doc.title }}</span>
+                  <button class="nf-kb-link__remove" title="解除关联" @click="onUnlinkDoc(doc.id)">×</button>
+                </div>
+              </div>
+              <p v-else class="nf-kb-empty">还没有关联的文档</p>
+            </div>
           </ATabPane>
         </ATabs>
 
@@ -864,5 +937,61 @@ function addFirst(): void {
   gap: 8px;
   padding: 12px 14px;
   border-top: 1px solid var(--nf-shell-line-soft);
+}
+
+/* ---------------- 关联（知识 / 文档） ---------------- */
+.nf-kb-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.nf-kb-link {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 8px;
+  border-radius: var(--nf-r-ctl);
+  background: var(--nf-shell-700);
+  border: 1px solid var(--nf-shell-line-soft);
+  font-size: var(--nf-fs-xs);
+  color: var(--nf-on-dark);
+}
+.nf-kb-link__type {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--nf-teal);
+  background: rgba(77, 208, 217, 0.12);
+  border-radius: var(--nf-r-chip);
+  padding: 1px 6px;
+}
+.nf-kb-link__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nf-kb-link__remove {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--nf-on-dark-faint);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 6px;
+  transition: color var(--nf-dur-fast) var(--nf-ease), background var(--nf-dur-fast) var(--nf-ease);
+}
+.nf-kb-link__remove:hover {
+  color: var(--nf-danger);
+  background: rgba(200, 106, 99, 0.12);
+}
+.nf-kb-empty {
+  margin: 0 0 8px;
+  font-size: var(--nf-fs-2xs);
+  color: var(--nf-on-dark-faint);
 }
 </style>

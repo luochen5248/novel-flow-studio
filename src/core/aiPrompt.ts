@@ -184,6 +184,8 @@ export const ASSIST_MODE_LABEL: Record<AssistMode, string> = {
 
 /** 提示词所需的节点切片（StoryNode 结构上天然兼容） */
 export interface AssistNodeContext {
+  /** 节点 id：AI 注入时按它反查关联文档锚点；**不进提示词**（纯透传字段） */
+  id?: string
   title?: string
   summary?: string
   content?: string
@@ -205,6 +207,12 @@ export interface BuildAssistOptions {
   instruction?: string
   /** 正文上下文字符上限（超出保留尾部） */
   maxContextChars?: number
+  /** 作者记忆块（预组装纯文本，插 system 位；为空则不插，输出与现状逐字节一致） */
+  memory?: string
+  /** 知识库参考块（预组装纯文本，插 user 位「光标选中的片段」之前） */
+  kbContext?: string
+  /** 写作依据块（关联文档锚点段，预组装纯文本，插 user 位 kbContext 之后） */
+  docContext?: string
 }
 
 const SYSTEM_COMMON = [
@@ -260,7 +268,13 @@ export function buildAssistPrompt(
   options: BuildAssistOptions
 ): ChatMessage[] {
   const mode = options.mode
-  const parts: string[] = [SYSTEM_COMMON, '', SYSTEM_BY_MODE[mode]]
+  // 作者记忆块插在 SYSTEM_COMMON 之后、SYSTEM_BY_MODE 之前：先立背景再下
+  // 任务最稳，且完全避开下面 research 的联网分支。memoryBlock 为空字符串
+  // 时不插 —— 输出与现状逐字节一致（回归安全，见 aiPrompt.spec.ts）。
+  const memoryBlock = (options.memory ?? '').trim()
+  const parts: string[] = memoryBlock
+    ? [SYSTEM_COMMON, '', memoryBlock, SYSTEM_BY_MODE[mode]]
+    : [SYSTEM_COMMON, '', SYSTEM_BY_MODE[mode]]
 
   if (mode === 'research') {
     parts.push(
@@ -303,6 +317,14 @@ export function buildAssistPrompt(
       ['## 后一个节点（后续走向）', `标题：${nb.next.title}`, ...line('摘要', nb.next.summary)].join('\n')
     )
   }
+
+  // 知识库参考 / 写作依据（文档锚点）：插在「光标选中的片段」之前 ——
+  // 节点自身内容永远离任务指令最近。两个块都由 src/core/kb/inject.ts
+  // 预组装成纯文本（自带小标题），本文件不 import 任何 kb 模块。
+  const kbContext = (options.kbContext ?? '').trim()
+  if (kbContext) blocks.push(kbContext)
+  const docContext = (options.docContext ?? '').trim()
+  if (docContext) blocks.push(docContext)
 
   const selection = (options.selection ?? '').trim()
   if (selection) {

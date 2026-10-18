@@ -8,6 +8,25 @@
  *  3. 字段名与 IPC 通道名一一对应（见 `AiApi`），不得擅自更名。
  */
 
+import type {
+  CreateAnchorInput,
+  CreateDocInput,
+  CreateEntryInput,
+  CreateMemoryInput,
+  CurateReport,
+  DocAnchor,
+  DocFormat,
+  KbDocument,
+  KbEvent,
+  KnowledgeEntry,
+  MemoryEntry,
+  PrefKey,
+  UpdateAnchorInput,
+  UpdateDocInput,
+  UpdateEntryInput,
+  UpdateMemoryInput
+} from '@/core/kb/types'
+
 /** 协议：openai = OpenAI 兼容（chat/images）；grsai = 私有「提交 + 轮询」 */
 export type ModelProtocol = 'openai' | 'grsai'
 /** 能力：llm = 对话/文本；image = 生图 */
@@ -131,6 +150,76 @@ export interface OkResult {
 }
 
 /* ------------------------------------------------------------------ */
+/* 知识库契约（kb:* IPC 面；数据形状与 src/core/kb/types.ts 同源）        */
+/* ------------------------------------------------------------------ */
+
+/** `kb:pick-doc` / `kb:read-doc` 的返回 */
+export interface KbDocPickResult {
+  ok: boolean
+  canceled?: boolean
+  path?: string
+  title?: string
+  format?: DocFormat
+  content?: string
+  error?: string
+}
+
+export interface KbApi {
+  /* ---- 知识条目 ---- */
+  listEntries: () => Promise<{ ok: boolean; entries?: KnowledgeEntry[]; error?: string }>
+  createEntry: (input: CreateEntryInput) => Promise<{ ok: boolean; entry?: KnowledgeEntry; error?: string }>
+  updateEntry: (
+    id: string,
+    patch: UpdateEntryInput
+  ) => Promise<{ ok: boolean; entry?: KnowledgeEntry; error?: string }>
+  removeEntry: (id: string) => Promise<{ ok: boolean; error?: string }>
+  searchEntries: (query: string) => Promise<{ ok: boolean; entries?: KnowledgeEntry[]; error?: string }>
+  /* ---- 节点关联 ---- */
+  listLinksForNode: (nodeId: string) => Promise<{ ok: boolean; entries?: KnowledgeEntry[]; docs?: KbDocument[]; error?: string }>
+  linkEntry: (entryId: string, nodeId: string) => Promise<{ ok: boolean; error?: string }>
+  unlinkEntry: (entryId: string, nodeId: string) => Promise<{ ok: boolean; error?: string }>
+  linkDoc: (docId: string, nodeId: string) => Promise<{ ok: boolean; error?: string }>
+  unlinkDoc: (docId: string, nodeId: string) => Promise<{ ok: boolean; error?: string }>
+  /* ---- 文档 ---- */
+  listDocs: () => Promise<{ ok: boolean; docs?: KbDocument[]; error?: string }>
+  getDoc: (id: string) => Promise<{ ok: boolean; doc?: KbDocument; error?: string }>
+  createDoc: (input: CreateDocInput) => Promise<{ ok: boolean; doc?: KbDocument; error?: string }>
+  updateDoc: (id: string, patch: UpdateDocInput) => Promise<{ ok: boolean; doc?: KbDocument; error?: string }>
+  removeDoc: (id: string) => Promise<{ ok: boolean; error?: string }>
+  pickDoc: () => Promise<KbDocPickResult>
+  readDoc: (path: string) => Promise<KbDocPickResult>
+  /* ---- 锚点 ---- */
+  listAnchors: (filter: { docId?: string; nodeId?: string }) => Promise<{ ok: boolean; anchors?: DocAnchor[]; error?: string }>
+  createAnchor: (input: CreateAnchorInput) => Promise<{ ok: boolean; anchor?: DocAnchor; error?: string }>
+  updateAnchor: (
+    id: string,
+    patch: UpdateAnchorInput
+  ) => Promise<{ ok: boolean; anchor?: DocAnchor; error?: string }>
+  removeAnchor: (id: string) => Promise<{ ok: boolean; error?: string }>
+  /* ---- 作者记忆 ---- */
+  listMemories: () => Promise<{ ok: boolean; memories?: MemoryEntry[]; error?: string }>
+  createMemory: (input: CreateMemoryInput) => Promise<{ ok: boolean; memory?: MemoryEntry; error?: string }>
+  updateMemory: (
+    id: string,
+    patch: UpdateMemoryInput
+  ) => Promise<{ ok: boolean; memory?: MemoryEntry; error?: string }>
+  removeMemory: (id: string) => Promise<{ ok: boolean; error?: string }>
+  resetMemories: () => Promise<{ ok: boolean; error?: string }>
+  exportMemories: () => Promise<{ ok: boolean; json?: string; error?: string }>
+  importMemories: (json: string) => Promise<{ ok: boolean; imported?: number; error?: string }>
+  /* ---- 偏好 ---- */
+  getPreferences: () => Promise<{ ok: boolean; preferences?: Record<string, string>; error?: string }>
+  setPreference: (key: PrefKey, value: string) => Promise<{ ok: boolean; error?: string }>
+  /* ---- 工作过程事件 ---- */
+  listEvents: (limit?: number) => Promise<{ ok: boolean; events?: KbEvent[]; error?: string }>
+  logEvent: (kind: string, refId: string | null, summary: string) => Promise<{ ok: boolean; error?: string }>
+  curate: () => Promise<{ ok: boolean; report?: CurateReport; error?: string }>
+  /* ---- 全量导入导出 ---- */
+  exportAll: () => Promise<{ ok: boolean; json?: string; error?: string }>
+  importAll: (json: string) => Promise<{ ok: boolean; entries?: number; documents?: number; memories?: number; error?: string }>
+}
+
+/* ------------------------------------------------------------------ */
 /* window.electronAPI（由 preload.cjs 注入）                            */
 /* ------------------------------------------------------------------ */
 
@@ -170,6 +259,8 @@ export interface ElectronApi {
   installUpdate: () => void
   onUpdateStatus: (callback: (payload: UpdateStatusPayload) => void) => () => void
   ai: AiApi
+  /** 知识库 / 文档 / 记忆（userData/novelflow.db；浏览器态为 undefined，前端据此降级到 IndexedDB） */
+  kb: KbApi
 }
 
 declare global {

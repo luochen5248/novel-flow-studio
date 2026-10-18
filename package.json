@@ -1,6 +1,6 @@
 {
   "name": "novelflow-studio",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "小说时间线流程图工坊 —— 为长篇小说作者准备的本地故事脉络绘制工具",
@@ -24,6 +24,7 @@
     "ant-design-vue": "^4.2.6",
     "electron-updater": "^6.3.9",
     "pinia": "^2.2.6",
+    "sql.js": "^1.15.0",
     "vue": "^3.5.13"
   },
   "devDependencies": {
@@ -52,14 +53,18 @@
       {
         "from": "electron/mcp",
         "to": "mcp",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "win": {
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ]
     },
