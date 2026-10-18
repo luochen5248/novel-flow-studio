@@ -12,6 +12,7 @@ import FlowSidebar from '@/components/sidebar/FlowSidebar.vue'
 import CanvasToolbar from '@/components/toolbar/CanvasToolbar.vue'
 import FlowCanvas from '@/components/canvas/FlowCanvas.vue'
 import NodeInspector from '@/components/inspector/NodeInspector.vue'
+import KnowledgePanel from '@/components/kb/KnowledgePanel.vue'
 import StoryEditorDrawer from '@/components/story/StoryEditorDrawer.vue'
 import AiImageDialog from '@/components/ai/AiImageDialog.vue'
 import ApiConsole from '@/components/dev/ApiConsole.vue'
@@ -63,6 +64,11 @@ function onAiOpenChange(value: boolean): void {
         三个对话框随它走，全仓仍只有一份。
       -->
       <ControlCenter />
+      <!--
+        知识库大面板：0.5.0 漏挂导致「打开知识库」无反应（store 置 panelOpen=true
+        却无组件消费）。它自带 Teleport + kbStore.panelOpen 显隐门，常驻无渲染开销。
+      -->
+      <KnowledgePanel />
     </div>
 
     <!-- 全局浮层：抽屉 / 弹窗 / 控制台均由 antd portal 渲染，挂载在此即可 -->

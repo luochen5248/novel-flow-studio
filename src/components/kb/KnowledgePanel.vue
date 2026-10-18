@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * KnowledgePanel —— 知识库大面板（居中弹窗 960×680，z-index 900 档）
+ * KnowledgePanel —— 知识库大面板（居中弹窗 1180×760，z-index 900 档）
  *
  * 形态与层级：照 ControlCenter 的弹窗骨架抄（Teleport + 遮罩 + Esc +
  * 焦点陷阱 + aria-modal + 焦点归还 + Tab 陷阱），**不再发明第二套**。
@@ -8,11 +8,14 @@
  * 打开时它先自关（openModelDialog 惯例），不会与本弹窗 950 同屏；
  * 从 NodeInspector「关联」TabPane 打开时也没有更高层弹层占用。
  *
+ * 布局对标 WorkBuddy「资料库」：左栏（搜索框 + 分区导航 + 最近访问），
+ * 右栏主区（标题行 + 显眼操作按钮 + 表格行列表 + 详情/编辑器）。
+ *
  * 三个分区：
- *  - 知识条目：搜索 + 类型过滤 + 列表 + 编辑器（标题 / 类型 / 内容 / 标签）；
- *  - 文档：上传（桌面态 pickDoc / 浏览器态 hidden input）+ 列表 + 查看器
+ *  - 知识条目：搜索 + 类型过滤 + 表格列表 + 编辑器（标题 / 类型 / 内容 / 标签）；
+ *  - 参考文档：上传（桌面态 pickDoc / 浏览器态 hidden input）+ 表格列表 + 查看器
  *    （鼠标划词 → 「把选中段关联到当前节点」建锚点；锚点列表可解除）；
- *  - 记忆：只读列表 + 编辑 / 删除 + 轻量新建（完整管理在 ControlCenter）。
+ *  - 作者记忆：只读表格列表 + 行内编辑 / 删除 + 轻量新建（完整管理在 ControlCenter）。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
@@ -25,6 +28,8 @@ import type {
   KbDocument,
   KnowledgeEntry,
   KnowledgeType,
+  MemoryEntry,
+  MemorySource,
   MemoryType
 } from '@/core/kb/types'
 
@@ -47,15 +52,22 @@ const SECTIONS: Array<{ key: KbPanelSection; label: string; icon: string }> = [
   },
   {
     key: 'docs',
-    label: '文档',
+    label: '参考文档',
     icon: 'M4 2.4 H9.4 L12 5 V13.6 H4 Z M6 8.2 H10 M6 10.6 H10 M6 12.6 H8.4'
   },
   {
     key: 'memory',
-    label: '记忆',
+    label: '作者记忆',
     icon: 'M8 2.6 A5.4 5.4 0 1 0 8 13.4 A4.2 4.2 0 0 1 8 2.6 Z M6.2 6.4 H9.8 M6.2 8.6 H9.8 M6.2 10.8 H8.4'
   }
 ]
+
+/** 左栏「最近访问」里区分来源分区的短标签 */
+const SECTION_SHORT: Record<KbPanelSection, string> = {
+  entries: '条目',
+  docs: '文档',
+  memory: '记忆'
+}
 
 const navCounts = computed<Record<KbPanelSection, number>>(() => ({
   entries: kbStore.entries.length,
@@ -63,7 +75,20 @@ const navCounts = computed<Record<KbPanelSection, number>>(() => ({
   memory: kbStore.memories.length
 }))
 
+/** 右栏标题行：当前分区元信息 + 数量文案 */
+const currentSection = computed(() => SECTIONS.find((s) => s.key === section.value) ?? SECTIONS[0])
+
+const sectionCountText = computed(() => {
+  const n = navCounts.value[section.value]
+  return section.value === 'docs' ? `共 ${n} 份文档` : `共 ${n} 条`
+})
+
 function setSection(key: KbPanelSection): void {
+  // 切分区时清空搜索：避免回到条目区时还套着上一个分区的查询条件
+  if (kbStore.panelSection !== key) {
+    clearSearch()
+    focusMemoryId.value = ''
+  }
   kbStore.panelSection = key
 }
 
@@ -163,11 +188,117 @@ const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
   decision: '决定',
   background: '背景'
 }
+const MEMORY_SOURCE_LABEL: Record<MemorySource, string> = {
+  manual: '手写',
+  assist: 'AI 转存',
+  auto: '整理升格'
+}
+const DOC_FORMAT_LABEL: Record<DocFormat, string> = {
+  md: 'Markdown',
+  txt: '纯文本',
+  docx: 'Word 文档'
+}
 
-/* ---------------- 分区一：知识条目 ---------------- */
+/** 条目类型小图标（装饰性，aria-hidden；stroke 风格与分区图标保持一致） */
+const ENTRY_TYPE_ICON: Record<KnowledgeType, string> = {
+  note: 'M3.4 2.6 H10.2 L12.6 5 V13.4 H3.4 Z M5.6 7.4 H10.4 M5.6 9.8 H10.4 M5.6 12.2 H8.2',
+  setting: 'M8 2.8 L13.2 5.2 V10.8 L8 13.2 L2.8 10.8 V5.2 Z M8 5.9 A2.1 2.1 0 1 0 8 10.1 A2.1 2.1 0 0 0 8 5.9',
+  character: 'M8 3.1 A2.2 2.2 0 1 0 8 7.5 A2.2 2.2 0 0 0 8 3.1 Z M3.4 13.4 C3.4 10.9 5.4 9.5 8 9.5 C10.6 9.5 12.6 10.9 12.6 13.4',
+  plot: 'M3 3.4 V12.6 H13 M5.4 10.2 L7.8 6.6 L10.4 8.6 L13 4.4',
+  style: 'M3 13.2 L4.4 9.4 L11 2.8 L13.2 5 L6.6 11.6 Z M11 2.8 L13.2 5'
+}
+
+/* ---------------- 左栏：搜索 + 最近访问 ---------------- */
 
 const searchQuery = ref('')
 const searchResults = ref<KnowledgeEntry[] | null>(null)
+
+/** 左栏搜索框对条目走 IPC 检索（既有逻辑）；文档 / 记忆无检索通道，走客户端子串过滤 */
+const displayDocs = computed<KbDocument[]>(() => {
+  const q = searchQuery.value.trim().toLowerCase()
+  if (!q) return kbStore.docs
+  return kbStore.docs.filter((d) => d.title.toLowerCase().includes(q))
+})
+
+const displayMemories = computed<MemoryEntry[]>(() => {
+  const q = searchQuery.value.trim().toLowerCase()
+  if (!q) return kbStore.memories
+  return kbStore.memories.filter((m) => m.content.toLowerCase().includes(q))
+})
+
+async function onSearch(): Promise<void> {
+  const q = searchQuery.value.trim()
+  if (!q) {
+    searchResults.value = null
+    return
+  }
+  if (section.value !== 'entries') return // 文档 / 记忆已由 computed 实时过滤
+  try {
+    searchResults.value = await kbStore.searchAction(q)
+  } catch (e) {
+    message.error(failText(e))
+  }
+}
+
+function clearSearch(): void {
+  searchQuery.value = ''
+  searchResults.value = null
+}
+
+interface RecentItem {
+  kind: KbPanelSection
+  id: string
+  title: string
+  updatedAt: number
+}
+
+/** 左栏「最近访问」：跨分区取 updatedAt 最新的若干条混合展示 */
+const RECENT_LIMIT = 6
+const recentItems = computed<RecentItem[]>(() => {
+  const mixed: RecentItem[] = [
+    ...kbStore.entries.map((e) => ({
+      kind: 'entries' as const,
+      id: e.id,
+      title: e.title,
+      updatedAt: e.updatedAt
+    })),
+    ...kbStore.docs.map((d) => ({
+      kind: 'docs' as const,
+      id: d.id,
+      title: d.title,
+      updatedAt: d.updatedAt
+    })),
+    ...kbStore.memories.map((m) => ({
+      kind: 'memory' as const,
+      id: m.id,
+      title: m.content.slice(0, 40) || '（空记忆）',
+      updatedAt: m.updatedAt
+    }))
+  ]
+  return mixed
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, RECENT_LIMIT)
+})
+
+/** 最近访问点击：跳到对应分区并选中该项（条目→编辑器 / 文档→查看器 / 记忆→高亮滚动） */
+async function openRecent(item: RecentItem): Promise<void> {
+  setSection(item.kind)
+  if (item.kind === 'entries') {
+    const hit = kbStore.entries.find((e) => e.id === item.id)
+    if (hit) onEditEntry(hit)
+  } else if (item.kind === 'docs') {
+    await onOpenDoc(item.id)
+  } else {
+    focusMemoryId.value = item.id
+    await nextTick()
+    panel.value
+      ?.querySelector<HTMLElement>('.nf-kb__tr--mem.is-focus')
+      ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }
+}
+
+/* ---------------- 分区一：知识条目 ---------------- */
+
 const typeFilter = ref<KnowledgeType | ''>('')
 
 const TYPE_OPTIONS: Array<{ value: KnowledgeType; label: string }> = [
@@ -183,24 +314,6 @@ const displayEntries = computed<KnowledgeEntry[]>(() => {
   return typeFilter.value ? base.filter((e) => e.type === typeFilter.value) : base
 })
 
-async function onSearch(): Promise<void> {
-  const q = searchQuery.value.trim()
-  if (!q) {
-    searchResults.value = null
-    return
-  }
-  try {
-    searchResults.value = await kbStore.searchAction(q)
-  } catch (e) {
-    message.error(failText(e))
-  }
-}
-
-function clearSearch(): void {
-  searchQuery.value = ''
-  searchResults.value = null
-}
-
 /** 编辑器草稿：editingEntryId 为空 = 新建 */
 const editingEntryId = ref('')
 const entryDraft = ref<{ title: string; type: KnowledgeType; content: string; tags: string }>({
@@ -209,6 +322,7 @@ const entryDraft = ref<{ title: string; type: KnowledgeType; content: string; ta
   content: '',
   tags: ''
 })
+const entryTitleInput = ref<HTMLInputElement | null>(null)
 
 function resetEntryDraft(): void {
   editingEntryId.value = ''
@@ -223,6 +337,12 @@ function onEditEntry(entry: KnowledgeEntry): void {
     content: entry.content,
     tags: entry.tags.join('，')
   }
+}
+
+/** 标题行「新建条目」：重置草稿并把焦点送到标题输入框（修复「找不到新建入口」） */
+function newEntryFromCta(): void {
+  resetEntryDraft()
+  void nextTick(() => entryTitleInput.value?.focus())
 }
 
 async function onSaveEntry(): Promise<void> {
@@ -396,6 +516,14 @@ const newMemoryText = ref('')
 const newMemoryType = ref<MemoryType>('preference')
 const editingMemoryId = ref('')
 const editingMemoryText = ref('')
+/** 左栏「最近访问」跳转到记忆时的高亮目标（无「打开」语义，用高亮 + 滚动代替） */
+const focusMemoryId = ref('')
+const memoryInput = ref<HTMLTextAreaElement | null>(null)
+
+/** 标题行「新建记忆」：焦点送到轻量新建输入框（完整管理在 ControlCenter） */
+function focusMemoryInput(): void {
+  memoryInput.value?.focus()
+}
 
 async function onSaveNewMemory(): Promise<void> {
   const text = newMemoryText.value.trim()
@@ -463,8 +591,44 @@ async function onRemoveMemory(id: string): Promise<void> {
         </header>
 
         <div class="nf-kb__body">
-          <!-- 左栏：分区导航 -->
+          <!-- 左栏：搜索 + 分区导航 + 最近访问（仿「我的资料库」） -->
           <nav class="nf-kb__nav">
+            <div class="nf-kb__searchbar">
+              <svg class="nf-kb__searchbar-icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                <path
+                  d="M7 2.8 A4.2 4.2 0 1 0 7 11.2 A4.2 4.2 0 0 0 7 2.8 M10.2 10.2 L13.4 13.4"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                  stroke-linecap="round"
+                />
+              </svg>
+              <input
+                v-model="searchQuery"
+                class="nf-kb__nav-search"
+                placeholder="搜索知识库"
+                @keyup.enter="onSearch"
+              />
+              <div class="nf-kb__searchbar-actions">
+                <button class="nf-kb__searchbar-btn" title="搜索（回车也可）" @click="onSearch">
+                  <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+                    <path
+                      d="M7 2.8 A4.2 4.2 0 1 0 7 11.2 A4.2 4.2 0 0 0 7 2.8 M10.2 10.2 L13.4 13.4"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.4"
+                      stroke-linecap="round"
+                    />
+                  </svg>
+                </button>
+                <button v-if="searchQuery" class="nf-kb__searchbar-btn" title="清除搜索" @click="clearSearch">
+                  <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+                    <path d="M4 4 L12 12 M12 4 L4 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+
             <button
               v-for="s in SECTIONS"
               :key="s.key"
@@ -485,62 +649,146 @@ async function onRemoveMemory(id: string): Promise<void> {
               <span>{{ s.label }}</span>
               <span class="nf-kb__nav-count">{{ navCounts[s.key] }}</span>
             </button>
+
+            <div class="nf-kb__nav-sep" aria-hidden="true" />
+            <p class="nf-kb__nav-group">最近访问</p>
+            <ul class="nf-kb__recent nf-scroll">
+              <li
+                v-for="r in recentItems"
+                :key="r.kind + r.id"
+                class="nf-kb__recent-item"
+                :title="`${SECTION_SHORT[r.kind]} · ${r.title}`"
+                @click="openRecent(r)"
+              >
+                <span class="nf-kb__recent-kind">{{ SECTION_SHORT[r.kind] }}</span>
+                <span class="nf-kb__recent-title">{{ r.title }}</span>
+              </li>
+              <li v-if="!recentItems.length" class="nf-kb__recent-empty">暂无记录</li>
+            </ul>
           </nav>
 
-          <!-- 右栏：分区内容 -->
+          <!-- 右栏主区：标题行（分区名 + 显眼操作按钮）+ 表格列表 + 详情/编辑器 -->
           <main class="nf-kb__main">
+            <div class="nf-kb__main-top">
+              <header class="nf-kb__main-head">
+                <div class="nf-kb__main-title">
+                  <h2 class="nf-kb__main-name">{{ currentSection.label }}</h2>
+                  <span class="nf-kb__main-count">{{ sectionCountText }}</span>
+                </div>
+                <!-- 右上角主色填充操作按钮：修复「上传 / 新建找不到」的体验 -->
+                <button
+                  v-if="section === 'entries'"
+                  class="nf-kb__cta"
+                  title="新建一条知识条目"
+                  @click="newEntryFromCta"
+                >
+                  <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                    <path d="M8 3.2 V12.8 M3.2 8 H12.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+                  </svg>
+                  <span>新建条目</span>
+                </button>
+                <button
+                  v-else-if="section === 'docs'"
+                  class="nf-kb__cta"
+                  :title="`上传文档（支持 md / txt${hasKbBridge() ? ' / docx' : ''}）`"
+                  @click="onUploadDoc"
+                >
+                  <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                    <path
+                      d="M8 10.6 V3.4 M5.4 6 L8 3.4 L10.6 6 M3.4 10.4 V12.6 H12.6 V10.4"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.6"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                  <span>上传文档</span>
+                </button>
+                <button v-else class="nf-kb__cta" title="新建一条作者记忆" @click="focusMemoryInput">
+                  <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                    <path d="M8 3.2 V12.8 M3.2 8 H12.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+                  </svg>
+                  <span>新建记忆</span>
+                </button>
+              </header>
+              <div v-if="section === 'entries'" class="nf-kb__filters">
+                <button
+                  class="nf-kb__chip"
+                  :class="{ 'is-active': typeFilter === '' }"
+                  @click="typeFilter = ''"
+                >
+                  全部
+                </button>
+                <button
+                  v-for="t in TYPE_OPTIONS"
+                  :key="t.value"
+                  class="nf-kb__chip"
+                  :class="{ 'is-active': typeFilter === t.value }"
+                  @click="typeFilter = t.value"
+                >
+                  {{ t.label }}
+                </button>
+              </div>
+            </div>
+
             <!-- ============ 知识条目 ============ -->
             <div v-if="section === 'entries'" class="nf-kb__split">
               <div class="nf-kb__col nf-kb__col--list">
-                <div class="nf-kb__toolbar">
-                  <input
-                    v-model="searchQuery"
-                    class="nf-kb__search"
-                    placeholder="搜索标题 / 标签 / 正文"
-                    @keyup.enter="onSearch"
-                  />
-                  <button class="nf-kb__mini" @click="onSearch">搜索</button>
-                  <button v-if="searchResults" class="nf-kb__mini" @click="clearSearch">清除</button>
-                </div>
-                <div class="nf-kb__filters">
-                  <button
-                    class="nf-kb__chip"
-                    :class="{ 'is-active': typeFilter === '' }"
-                    @click="typeFilter = ''"
-                  >
-                    全部
-                  </button>
-                  <button
-                    v-for="t in TYPE_OPTIONS"
-                    :key="t.value"
-                    class="nf-kb__chip"
-                    :class="{ 'is-active': typeFilter === t.value }"
-                    @click="typeFilter = t.value"
-                  >
-                    {{ t.label }}
-                  </button>
-                </div>
-                <ul class="nf-kb__list nf-scroll">
+                <ul class="nf-kb__table nf-scroll">
+                  <li class="nf-kb__tr nf-kb__tr--head" aria-hidden="true">
+                    <span class="nf-kb__th">名称</span>
+                    <span class="nf-kb__th">类型</span>
+                    <span class="nf-kb__th">位置</span>
+                    <span class="nf-kb__th nf-kb__th--end">最近访问</span>
+                  </li>
                   <li
                     v-for="e in displayEntries"
                     :key="e.id"
-                    class="nf-kb__item"
+                    class="nf-kb__tr"
                     :class="{ 'is-active': editingEntryId === e.id }"
+                    :title="e.title"
                     @click="onEditEntry(e)"
                   >
-                    <span class="nf-kb__item-type">{{ ENTRY_TYPE_LABEL[e.type] }}</span>
-                    <span class="nf-kb__item-title">{{ e.title }}</span>
-                    <span class="nf-kb__item-date">{{ formatDate(e.updatedAt) }}</span>
+                    <span class="nf-kb__td nf-kb__td--name">
+                      <svg class="nf-kb__type-icon" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+                        <path
+                          :d="ENTRY_TYPE_ICON[e.type]"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.3"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        />
+                      </svg>
+                      <span class="nf-kb__tr-title">{{ e.title }}</span>
+                    </span>
+                    <span class="nf-kb__td nf-kb__td--type">
+                      <span class="nf-kb__tag">{{ ENTRY_TYPE_LABEL[e.type] }}</span>
+                    </span>
+                    <!-- 位置列：条目没有独立的「目录」概念，用标签当作来源信息 -->
+                    <span class="nf-kb__td nf-kb__td--loc">
+                      {{
+                        e.tags.length
+                          ? e.tags.slice(0, 2).join(' · ') + (e.tags.length > 2 ? ` +${e.tags.length - 2}` : '')
+                          : '—'
+                      }}
+                    </span>
+                    <span class="nf-kb__td nf-kb__td--date">{{ formatDate(e.updatedAt) }}</span>
                   </li>
                   <li v-if="!displayEntries.length" class="nf-kb__empty">
-                    {{ searchResults ? '没有匹配的条目' : '还没有条目，右边新建一条' }}
+                    {{ searchResults ? '没有匹配的条目' : '还没有条目，点右上角「新建条目」开始' }}
                   </li>
                 </ul>
-                <button class="nf-kb__new" @click="resetEntryDraft">+ 新建条目</button>
               </div>
 
               <div class="nf-kb__col nf-kb__col--editor">
+                <div class="nf-kb__detail-head">
+                  <span class="nf-kb__detail-title">{{ editingEntryId ? '编辑条目' : '新建条目' }}</span>
+                  <span v-if="editingEntryId" class="nf-kb__detail-sub">{{ entryDraft.title }}</span>
+                </div>
                 <input
+                  ref="entryTitleInput"
                   v-model="entryDraft.title"
                   class="nf-kb__title-input"
                   placeholder="条目标题"
@@ -576,26 +824,40 @@ async function onRemoveMemory(id: string): Promise<void> {
               </div>
             </div>
 
-            <!-- ============ 文档 ============ -->
+            <!-- ============ 参考文档 ============ -->
             <div v-else-if="section === 'docs'" class="nf-kb__split">
               <div class="nf-kb__col nf-kb__col--list">
-                <button class="nf-kb__new" @click="onUploadDoc">
-                  + 上传文档（md / txt{{ hasKbBridge() ? ' / docx' : '' }}）
-                </button>
+                <!-- 浏览器态上传入口：仅 .md / .txt（docx 解析仅桌面端）；桌面态走 pickDoc 对话框 -->
                 <input ref="docFileInput" type="file" accept=".md,.txt" hidden @change="onDocFile" />
-                <ul class="nf-kb__list nf-scroll">
+                <ul class="nf-kb__table nf-scroll">
+                  <li class="nf-kb__tr nf-kb__tr--head" aria-hidden="true">
+                    <span class="nf-kb__th">名称</span>
+                    <span class="nf-kb__th">类型</span>
+                    <span class="nf-kb__th">位置</span>
+                    <span class="nf-kb__th nf-kb__th--end">最近访问</span>
+                  </li>
                   <li
-                    v-for="d in kbStore.docs"
+                    v-for="d in displayDocs"
                     :key="d.id"
-                    class="nf-kb__item"
+                    class="nf-kb__tr"
                     :class="{ 'is-active': currentDoc && currentDoc.id === d.id }"
+                    :title="d.title"
                     @click="onOpenDoc(d.id)"
                   >
-                    <span class="nf-kb__item-type">{{ d.format.toUpperCase() }}</span>
-                    <span class="nf-kb__item-title">{{ d.title }}</span>
-                    <span class="nf-kb__item-date">{{ formatDate(d.updatedAt) }}</span>
+                    <span class="nf-kb__td nf-kb__td--name">
+                      <span class="nf-kb__fmt">{{ d.format.toUpperCase() }}</span>
+                      <span class="nf-kb__tr-title">{{ d.title }}</span>
+                    </span>
+                    <span class="nf-kb__td nf-kb__td--type">
+                      <span class="nf-kb__tag">{{ DOC_FORMAT_LABEL[d.format] }}</span>
+                    </span>
+                    <!-- 位置列：文档统一来自本机导入，展示格式来源 -->
+                    <span class="nf-kb__td nf-kb__td--loc">本机导入</span>
+                    <span class="nf-kb__td nf-kb__td--date">{{ formatDate(d.updatedAt) }}</span>
                   </li>
-                  <li v-if="!kbStore.docs.length" class="nf-kb__empty">还没有文档，先上传一份</li>
+                  <li v-if="!displayDocs.length" class="nf-kb__empty">
+                    {{ searchQuery ? '没有匹配的文档' : '还没有文档，点右上角「上传文档」导入' }}
+                  </li>
                 </ul>
               </div>
 
@@ -641,10 +903,11 @@ async function onRemoveMemory(id: string): Promise<void> {
               </div>
             </div>
 
-            <!-- ============ 记忆 ============ -->
+            <!-- ============ 作者记忆 ============ -->
             <div v-else class="nf-kb__col nf-kb__col--memory">
-              <div class="nf-kb__toolbar nf-kb__toolbar--memory">
+              <div class="nf-kb__toolbar--memory">
                 <textarea
+                  ref="memoryInput"
                   v-model="newMemoryText"
                   class="nf-kb__content nf-kb__content--sm"
                   rows="2"
@@ -657,30 +920,63 @@ async function onRemoveMemory(id: string): Promise<void> {
                 </select>
                 <button class="nf-kb__mini is-primary" @click="onSaveNewMemory">保存</button>
               </div>
-              <ul class="nf-kb__list nf-scroll">
-                <li v-for="m in kbStore.memories" :key="m.id" class="nf-kb__item nf-kb__item--memory">
+              <ul class="nf-kb__table nf-kb__table--mem nf-scroll">
+                <li class="nf-kb__tr nf-kb__tr--head" aria-hidden="true">
+                  <span class="nf-kb__th">名称</span>
+                  <span class="nf-kb__th">类型</span>
+                  <span class="nf-kb__th">位置</span>
+                  <span class="nf-kb__th nf-kb__th--end">最近访问</span>
+                </li>
+                <li
+                  v-for="m in displayMemories"
+                  :key="m.id"
+                  class="nf-kb__tr nf-kb__tr--mem"
+                  :class="{ 'is-focus': focusMemoryId === m.id }"
+                >
                   <template v-if="editingMemoryId === m.id">
-                    <textarea
-                      v-model="editingMemoryText"
-                      class="nf-kb__content nf-kb__content--sm"
-                      rows="2"
-                    />
-                    <span class="nf-kb__item-actions">
+                    <span class="nf-kb__td nf-kb__td--name">
+                      <textarea
+                        v-model="editingMemoryText"
+                        class="nf-kb__mem-edit"
+                        rows="2"
+                      />
+                    </span>
+                    <span class="nf-kb__td nf-kb__td--type">
+                      <span class="nf-kb__tag">{{ MEMORY_TYPE_LABEL[m.type] }}</span>
+                    </span>
+                    <span class="nf-kb__td nf-kb__td--loc">{{ MEMORY_SOURCE_LABEL[m.source] }}</span>
+                    <span class="nf-kb__td nf-kb__td--date">
                       <button class="nf-kb__mini" @click="onSaveMemoryEdit">保存</button>
                       <button class="nf-kb__mini" @click="editingMemoryId = ''">取消</button>
                     </span>
                   </template>
                   <template v-else>
-                    <span class="nf-kb__item-type">{{ MEMORY_TYPE_LABEL[m.type] }}</span>
-                    <span class="nf-kb__item-title nf-kb__memory-text">{{ m.content }}</span>
-                    <span class="nf-kb__item-actions">
+                    <span class="nf-kb__td nf-kb__td--name" :title="m.content">
+                      <svg class="nf-kb__type-icon" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+                        <path
+                          d="M8 2.6 A5.4 5.4 0 1 0 8 13.4 A4.2 4.2 0 0 1 8 2.6 Z M6.2 6.4 H9.8 M6.2 8.6 H9.8 M6.2 10.8 H8.4"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.3"
+                          stroke-linecap="round"
+                        />
+                      </svg>
+                      <span class="nf-kb__tr-title">{{ m.content }}</span>
+                    </span>
+                    <span class="nf-kb__td nf-kb__td--type">
+                      <span class="nf-kb__tag">{{ MEMORY_TYPE_LABEL[m.type] }}</span>
+                    </span>
+                    <span class="nf-kb__td nf-kb__td--loc">{{ MEMORY_SOURCE_LABEL[m.source] }}</span>
+                    <span class="nf-kb__td nf-kb__td--date">
+                      <span class="nf-kb__row-date">{{ formatDate(m.updatedAt) }}</span>
+                      <!-- 改 / 删直接做日期格的 flex 子项（与编辑态的保存 / 取消同构），间距复用格内 gap -->
                       <button class="nf-kb__mini" @click="onEditMemory(m)">改</button>
                       <button class="nf-kb__mini is-danger" @click="onRemoveMemory(m.id)">删</button>
                     </span>
                   </template>
                 </li>
-                <li v-if="!kbStore.memories.length" class="nf-kb__empty">
-                  还没有记忆。AI 结果可在写作浮层里「存为记忆」。
+                <li v-if="!displayMemories.length" class="nf-kb__empty">
+                  {{ searchQuery ? '没有匹配的记忆' : '还没有记忆。AI 结果可在写作浮层里「存为记忆」。' }}
                 </li>
               </ul>
               <p class="nf-kb__hint">导入 / 导出 / 重置在左下角「控制中心 → 记忆与进化」。</p>
@@ -696,8 +992,8 @@ async function onRemoveMemory(id: string): Promise<void> {
 /*
  * z-index 900：业务弹层档（UpdateDialog / ApiConsole 同档）。从 ControlCenter
  * （950）打开时它先自关，不同屏；NodeInspector 打开时无更高层占用。
- * 视觉纪律：全部 --nf-* token，禁纯黑 / 霓虹渐变 / 等宽字体 / 直角 / 回弹；
- * 动效 ease-out（--nf-ease）。
+ * 视觉纪律：全部 --nf-* token，禁纯黑 / 霓虹渐变 / 等宽字体 / 直角 / 回弹 /
+ * 虚线边框；动效 ease-out（--nf-ease，150-250ms 档）。
  */
 .nf-kb-modal {
   position: fixed;
@@ -711,10 +1007,9 @@ async function onRemoveMemory(id: string): Promise<void> {
 }
 
 .nf-kb-modal__panel {
-  width: 960px;
-  height: 680px;
-  max-width: calc(100vw - 32px);
-  max-height: calc(100vh - 32px);
+  /* 资料库级大面板：viewport 收窄时按比例收缩，不再写死 960×680 */
+  width: min(1180px, 94vw);
+  height: min(760px, 88vh);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -782,15 +1077,74 @@ async function onRemoveMemory(id: string): Promise<void> {
   display: flex;
 }
 
+/* ---------------- 左栏（仿「我的资料库」） ---------------- */
 .nf-kb__nav {
   flex: none;
-  width: 168px;
-  padding: 12px 10px 16px;
+  width: 240px;
+  padding: 14px 12px 16px;
   border-right: 1px solid var(--nf-shell-line-soft);
   display: flex;
   flex-direction: column;
-  gap: 4px;
 }
+
+/* 左栏搜索框：图标 + 输入 + 搜索 / 清除两个小按钮 */
+.nf-kb__searchbar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.nf-kb__nav-search {
+  width: 100%;
+  height: 32px;
+  padding: 0 62px 0 30px;
+  border-radius: var(--nf-r-ctl);
+  border: 1px solid var(--nf-shell-line);
+  background: rgba(8, 14, 19, 0.4);
+  color: var(--nf-on-dark);
+  font-size: var(--nf-fs-xs);
+  transition: border-color var(--nf-dur-fast) var(--nf-ease);
+}
+.nf-kb__nav-search:focus {
+  outline: none;
+  border-color: rgba(77, 208, 217, 0.45);
+}
+.nf-kb__nav-search::placeholder {
+  color: var(--nf-on-dark-faint);
+}
+.nf-kb__searchbar-icon {
+  position: absolute;
+  left: 10px;
+  color: var(--nf-on-dark-faint);
+  pointer-events: none;
+}
+.nf-kb__searchbar-actions {
+  position: absolute;
+  right: 5px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.nf-kb__searchbar-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--nf-on-dark-soft);
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition:
+    color var(--nf-dur-fast) var(--nf-ease),
+    background var(--nf-dur-fast) var(--nf-ease);
+}
+.nf-kb__searchbar-btn:hover {
+  color: var(--nf-teal);
+  background: rgba(77, 208, 217, 0.1);
+}
+
 .nf-kb__nav-item {
   appearance: none;
   border: none;
@@ -829,6 +1183,72 @@ async function onRemoveMemory(id: string): Promise<void> {
   font-variant-numeric: tabular-nums;
 }
 
+/* 左栏「最近访问」分组：跨分区混合，点击跳转并选中 */
+.nf-kb__nav-sep {
+  flex: none;
+  height: 1px;
+  background: var(--nf-shell-line-soft);
+  margin: 12px 4px 10px;
+}
+.nf-kb__nav-group {
+  flex: none;
+  margin: 0 0 4px;
+  padding: 0 10px;
+  font-size: var(--nf-fs-2xs);
+  letter-spacing: 0.06em;
+  color: var(--nf-on-dark-faint);
+}
+.nf-kb__recent {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.nf-kb__recent-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border-radius: var(--nf-r-ctl);
+  cursor: pointer;
+  font-size: var(--nf-fs-xs);
+  color: var(--nf-on-dark);
+  transition:
+    color var(--nf-dur-fast) var(--nf-ease),
+    background var(--nf-dur-fast) var(--nf-ease);
+}
+.nf-kb__recent-item:hover {
+  color: var(--nf-on-dark-strong);
+  background: rgba(148, 172, 196, 0.08);
+}
+.nf-kb__recent-kind {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--nf-teal);
+  background: rgba(77, 208, 217, 0.12);
+  border-radius: var(--nf-r-chip);
+  padding: 1px 6px;
+}
+.nf-kb__recent-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nf-kb__recent-empty {
+  padding: 6px 10px;
+  font-size: var(--nf-fs-2xs);
+  color: var(--nf-on-dark-faint);
+}
+
+/* ---------------- 右栏主区 ---------------- */
 .nf-kb__main {
   flex: 1 1 auto;
   min-width: 0;
@@ -836,7 +1256,72 @@ async function onRemoveMemory(id: string): Promise<void> {
   flex-direction: column;
 }
 
-/* ---------------- 两栏布局（列表 / 编辑或查看） ---------------- */
+/* 标题行 + 过滤条（合在一起加下边线，与表格区分隔） */
+.nf-kb__main-top {
+  flex: none;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--nf-shell-line-soft);
+}
+.nf-kb__main-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px 8px;
+}
+.nf-kb__main-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.nf-kb__main-name {
+  margin: 0;
+  font-size: var(--nf-fs-md);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--nf-on-dark-strong);
+}
+.nf-kb__main-count {
+  font-size: var(--nf-fs-2xs);
+  color: var(--nf-on-dark-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 右上角主色填充操作按钮：全面板视觉重心，修复「上传 / 新建找不到」 */
+.nf-kb__cta {
+  margin-left: auto;
+  appearance: none;
+  border: none;
+  height: 32px;
+  padding: 0 14px;
+  border-radius: var(--nf-r-ctl);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--nf-teal);
+  color: var(--nf-shell-900);
+  font-size: var(--nf-fs-sm);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    filter var(--nf-dur-fast) var(--nf-ease),
+    box-shadow var(--nf-dur-fast) var(--nf-ease);
+}
+.nf-kb__cta:hover {
+  filter: brightness(1.08);
+  box-shadow: 0 0 0 3px rgba(77, 208, 217, 0.18);
+}
+
+.nf-kb__filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 18px 0;
+}
+
+/* ---------------- 两栏布局（表格列表 / 编辑或查看） ---------------- */
 .nf-kb__split {
   flex: 1 1 auto;
   min-height: 0;
@@ -846,11 +1331,13 @@ async function onRemoveMemory(id: string): Promise<void> {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 14px 16px;
+  padding: 12px 18px 16px;
 }
 .nf-kb__col--list {
   flex: none;
-  width: 300px;
+  width: 520px;
+  /* 窄窗口下不让列表把详情区挤没 */
+  max-width: 56%;
   border-right: 1px solid var(--nf-shell-line-soft);
 }
 .nf-kb__col--editor,
@@ -860,48 +1347,104 @@ async function onRemoveMemory(id: string): Promise<void> {
   min-width: 0;
 }
 
-/* ---------------- 控件 ---------------- */
-.nf-kb__toolbar {
-  display: flex;
-  gap: 6px;
-  margin-bottom: 10px;
-}
-.nf-kb__toolbar--memory {
-  align-items: flex-start;
-}
-.nf-kb__toolbar--memory .nf-kb__content--sm {
+/* ---------------- 表格行列表（仿资料库列表） ---------------- */
+.nf-kb__table {
   flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
 }
-.nf-kb__search,
-.nf-kb__title-input,
-.nf-kb__tags-input,
-.nf-kb__select {
-  height: 30px;
-  padding: 0 10px;
+/* 四列网格：名称（弹性）/ 类型 / 位置 / 最近访问（右对齐） */
+.nf-kb__tr {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 76px 108px 84px;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
   border-radius: var(--nf-r-ctl);
-  border: 1px solid var(--nf-shell-line);
-  background: rgba(8, 14, 19, 0.4);
+  cursor: pointer;
+  font-size: var(--nf-fs-xs);
   color: var(--nf-on-dark);
-  font-size: var(--nf-fs-sm);
+  transition:
+    background var(--nf-dur-fast) var(--nf-ease),
+    color var(--nf-dur-fast) var(--nf-ease);
 }
-.nf-kb__search {
+.nf-kb__tr--head {
+  cursor: default;
+  padding: 2px 12px 8px;
+  border-radius: 0;
+  border-bottom: 1px solid var(--nf-shell-line-soft);
+  margin-bottom: 4px;
+}
+.nf-kb__tr:not(.nf-kb__tr--head):hover {
+  background: rgba(148, 172, 196, 0.08);
+}
+.nf-kb__tr.is-active,
+.nf-kb__tr.is-focus {
+  background: rgba(77, 208, 217, 0.1);
+}
+.nf-kb__tr--mem {
+  cursor: default;
+  align-items: center;
+}
+/* 记忆行末列要同时放日期 + 改 / 删（或保存 / 取消）两个小按钮，比其他表格宽 */
+.nf-kb__table--mem .nf-kb__tr {
+  grid-template-columns: minmax(0, 1fr) 72px 92px 152px;
+}
+.nf-kb__th {
+  font-size: var(--nf-fs-2xs);
+  letter-spacing: 0.06em;
+  color: var(--nf-on-dark-faint);
+}
+.nf-kb__th--end {
+  text-align: right;
+}
+.nf-kb__td {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nf-kb__td--name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.nf-kb__td--type {
+  overflow: visible;
+}
+.nf-kb__td--loc {
+  color: var(--nf-on-dark-soft);
+}
+.nf-kb__td--date {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  color: var(--nf-on-dark-faint);
+  font-variant-numeric: tabular-nums;
+}
+.nf-kb__row-date {
+  flex: none;
+}
+.nf-kb__tr-title {
   flex: 1 1 auto;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.nf-kb__search:focus,
-.nf-kb__title-input:focus,
-.nf-kb__tags-input:focus,
-.nf-kb__select:focus,
-.nf-kb__content:focus {
-  outline: none;
-  border-color: rgba(77, 208, 217, 0.45);
+.nf-kb__type-icon {
+  flex: none;
+  color: var(--nf-teal);
+  opacity: 0.85;
 }
-.nf-kb__filters {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 10px;
-}
+
+/* ---------------- 控件 ---------------- */
 .nf-kb__chip {
   appearance: none;
   border: 1px solid var(--nf-shell-line);
@@ -960,99 +1503,67 @@ async function onRemoveMemory(id: string): Promise<void> {
   cursor: not-allowed;
 }
 
-.nf-kb__new {
-  margin-top: 8px;
-  appearance: none;
-  border: 1px dashed rgba(77, 208, 217, 0.42);
-  background: transparent;
-  color: var(--nf-teal);
-  height: 32px;
-  border-radius: var(--nf-r-ctl);
-  cursor: pointer;
-  font-size: var(--nf-fs-sm);
-  letter-spacing: 0.02em;
-  transition: background var(--nf-dur-fast) var(--nf-ease);
-}
-.nf-kb__new:hover {
-  background: rgba(77, 208, 217, 0.1);
-}
-
-/* ---------------- 列表 ---------------- */
-.nf-kb__list {
-  flex: 1 1 auto;
-  min-height: 0;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.nf-kb__item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  border-radius: var(--nf-r-ctl);
-  background: var(--nf-shell-700);
-  border: 1px solid var(--nf-shell-line-soft);
-  cursor: pointer;
-  font-size: var(--nf-fs-xs);
-  color: var(--nf-on-dark);
-  transition: border-color var(--nf-dur-fast) var(--nf-ease);
-}
-.nf-kb__item:hover {
-  border-color: rgba(77, 208, 217, 0.32);
-}
-.nf-kb__item.is-active {
-  border-color: rgba(77, 208, 217, 0.55);
-  background: rgba(77, 208, 217, 0.1);
-}
-.nf-kb__item--memory {
-  cursor: default;
-  align-items: flex-start;
-}
-.nf-kb__item-type {
+/* 表格内的类型徽标 / 文档格式徽标 */
+.nf-kb__tag,
+.nf-kb__fmt {
   flex: none;
   font-size: 10px;
   letter-spacing: 0.06em;
+  border-radius: var(--nf-r-chip);
+  padding: 1px 7px;
+}
+.nf-kb__tag {
   color: var(--nf-teal);
   background: rgba(77, 208, 217, 0.12);
-  border-radius: var(--nf-r-chip);
-  padding: 1px 6px;
 }
-.nf-kb__item-title {
+.nf-kb__fmt {
+  color: var(--nf-on-dark-soft);
+  background: rgba(148, 172, 196, 0.14);
+}
+
+.nf-kb__title-input,
+.nf-kb__tags-input,
+.nf-kb__select {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: var(--nf-r-ctl);
+  border: 1px solid var(--nf-shell-line);
+  background: rgba(8, 14, 19, 0.4);
+  color: var(--nf-on-dark);
+  font-size: var(--nf-fs-sm);
+}
+.nf-kb__title-input:focus,
+.nf-kb__tags-input:focus,
+.nf-kb__select:focus,
+.nf-kb__content:focus,
+.nf-kb__nav-search:focus,
+.nf-kb__mem-edit:focus {
+  outline: none;
+  border-color: rgba(77, 208, 217, 0.45);
+}
+
+/* ---------------- 详情列头（编辑器 / 查看器） ---------------- */
+.nf-kb__detail-head {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 10px;
+  min-width: 0;
+}
+.nf-kb__detail-title {
+  font-size: var(--nf-fs-sm);
+  font-weight: 600;
+  color: var(--nf-on-dark-strong);
+}
+.nf-kb__detail-sub {
   flex: 1 1 auto;
   min-width: 0;
+  font-size: var(--nf-fs-2xs);
+  color: var(--nf-on-dark-faint);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.nf-kb__memory-text {
-  white-space: pre-wrap;
-  line-height: 1.6;
-}
-.nf-kb__item-date {
-  flex: none;
-  font-size: 10px;
-  color: var(--nf-on-dark-faint);
-  font-variant-numeric: tabular-nums;
-}
-.nf-kb__item-actions {
-  flex: none;
-  display: flex;
-  gap: 4px;
-}
-.nf-kb__empty {
-  padding: 14px 10px;
-  font-size: var(--nf-fs-2xs);
-  line-height: 1.7;
-  color: var(--nf-on-dark-faint);
-}
-.nf-kb__empty--center {
-  margin: auto;
-  text-align: center;
 }
 
 /* ---------------- 条目编辑器 ---------------- */
@@ -1139,7 +1650,7 @@ async function onRemoveMemory(id: string): Promise<void> {
   margin: 0;
   padding: 0;
   list-style: none;
-  max-height: 108px;
+  max-height: 120px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -1163,6 +1674,39 @@ async function onRemoveMemory(id: string): Promise<void> {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--nf-on-dark-soft);
+}
+
+/* ---------------- 记忆 ---------------- */
+.nf-kb__toolbar--memory {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+  align-items: flex-start;
+}
+.nf-kb__toolbar--memory .nf-kb__content--sm {
+  flex: 1 1 auto;
+}
+.nf-kb__mem-edit {
+  width: 100%;
+  resize: vertical;
+  padding: 6px 9px;
+  border-radius: var(--nf-r-ctl);
+  border: 1px solid var(--nf-shell-line);
+  background: rgba(8, 14, 19, 0.4);
+  color: var(--nf-on-dark);
+  font-size: var(--nf-fs-xs);
+  line-height: 1.6;
+}
+
+.nf-kb__empty {
+  padding: 14px 10px;
+  font-size: var(--nf-fs-2xs);
+  line-height: 1.7;
+  color: var(--nf-on-dark-faint);
+}
+.nf-kb__empty--center {
+  margin: auto;
+  text-align: center;
 }
 .nf-kb__hint {
   flex: none;
