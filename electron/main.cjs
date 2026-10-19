@@ -11,17 +11,23 @@
  *  4. AI 模型管理：用户自定义 OpenAI 兼容端点 / 密钥存 userData/config.json，
  *     由主进程用原生 fetch 代发（含流式与取消），**密钥永不出主进程**；
  *     内置 grsai 生图纳入统一管理（复用旧 grsaiKey 字段，老 webRequest 链路保留不动）。
+ *  5. 语义索引（task-001）：embedding 只走本机 Ollama / LM Studio，向量存独立的
+ *     userData/novelflow-vectors.db；无本地服务时明说降级到关键词检索。
  *
  * 约定：本文件为 CommonJS（.cjs），与 package.json 的 "type": "module" 隔离，避免 ESM 坑。
  */
 const { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, session, dialog } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
+// worker_threads：.docx 解析挪出主进程用（Node 内置，零新增依赖；见 extractDocxTextViaWorker）
+const { Worker } = require('node:worker_threads')
 
 // 知识库数据库（sql.js）与 .docx 纯文本抽取：只被 GUI 实例使用
 // （initKbStore 内部对 MCP_MODE 有注释性守卫；store.cjs 顶层不碰 sql.js，
 //  真正 require('sql.js') 发生在 initKbStore 里，桥接实例零成本）
 const kbStore = require('./kb/store.cjs')
+// 语义索引向量库：独立 db 文件（userData/novelflow-vectors.db），见文件头
+const vecStore = require('./kb/vecstore.cjs')
 const { extractDocxText } = require('./kb/docx.cjs')
 
 /** grsai 真实 API 地址（与 vite.config.ts 的代理 target 保持同源） */
@@ -1177,6 +1183,150 @@ ipcMain.handle('ai:image', async (_event, req) => {
 })
 
 /* ------------------------------------------------------------------ */
+/* Embedding（语义索引用）：只走本机 Ollama / LM Studio                   */
+/*                                                                     */
+/* 隐私口径由用户拍板：**正文绝不发往第三方**。所以这里比 AI 对话多一道    */
+/* 硬校验 —— baseUrl 的主机名必须是环回地址，否则直接拒绝。              */
+/*                                                                     */
+/* 配置面刻意放在**知识库偏好表**（preferences）而不是 config.json：       */
+/* 读写走 task-002 已有的 `kb:get-preferences` / `kb:set-preference`      */
+/* 两条通道，`KbApi` 里早就有类型声明，于是**不必新增任何 IPC、也不必动    */
+/* src/types/ai.ts 那个「前端禁改」的契约红线文件** —— 这是「折中先行」    */
+/* 能落地的关键：用户可以在界面里配端点，而契约文件一个字都不改。          */
+/* ------------------------------------------------------------------ */
+
+/** 本机预设：Ollama 默认端口（LM Studio 常用 http://localhost:1234/v1） */
+const EMBED_DEFAULT_BASE_URL = 'http://localhost:11434/v1'
+/** 本机常用中文 embedding 模型名（缺省值只是指引，用户可在知识库偏好里改） */
+const EMBED_DEFAULT_MODEL = 'nomic-embed-text'
+/** 偏好键：本地 embedding 端点（与 src/api/kbClient.ts 的同名常量同源） */
+const PREF_EMBEDDING_BASE_URL = 'pref.embedding_base_url'
+/** 偏好键：本地 embedding 模型名 */
+const PREF_EMBEDDING_MODEL = 'pref.embedding_model'
+/** embedding 请求超时：本地 CPU 推理可能较慢，给到 60s */
+const AI_EMBED_TIMEOUT = 60_000
+/** 一批最多 embedding 多少块：本地服务一次吃太多会排队很久，也方便失败只丢一批 */
+const EMBED_BATCH_SIZE = 16
+/** 单次重建的块数硬上限：防一篇超长文档把重建拖到几十分钟 */
+const VEC_REBUILD_MAX_CHUNKS = 4000
+/** 允许的环回主机名（IPv6 一并放行；new URL 对 IPv6 会保留方括号，两种写法都收） */
+const LOCAL_EMBED_HOSTS = ['localhost', '127.0.0.1', '::1', '[::1]', '0:0:0:0:0:0:0:1']
+/** 非本机地址的统一中文错误（用户拍板的原话口径） */
+const EMBED_LOCAL_ONLY_ERROR = '仅支持本地 embedding 服务（Ollama / LM Studio），请填写本机地址'
+
+/**
+ * 读 embedding 配置（事实源 = 知识库 preferences 表）。
+ *
+ * 为什么从 kbStore 读而不是 readConfig()：配置必须能被用户在界面里改，
+ * 而能改的通道只有「偏好」这一条（preload 不能新增通道，因为类型在红线
+ * 文件里）。config.json 里那套 `embedding` 字段已废弃、不再作为事实源 ——
+ * 双源必然漂移，宁可只留一个。
+ *
+ * 缺字段就填本机预设，绝不因为「没配过」而卡住整个功能；维度不在这里配，
+ * 由首次 embedding 返回的向量长度自动推断（用户手填容易错，且换模型就失效）。
+ */
+function getEmbeddingConfig() {
+  let prefs = {}
+  if (kbStore.isKbReady()) {
+    try {
+      prefs = kbStore.kbGetPreferences() ?? {}
+    } catch {
+      // 偏好读失败按「未配置」处理：下面是本机预设 + 本地强校验，不会发往第三方
+      prefs = {}
+    }
+  }
+  return {
+    baseUrl: String(prefs[PREF_EMBEDDING_BASE_URL] ?? '').trim() || EMBED_DEFAULT_BASE_URL,
+    model: String(prefs[PREF_EMBEDDING_MODEL] ?? '').trim() || EMBED_DEFAULT_MODEL
+  }
+}
+
+/**
+ * 本机强校验：通过返回 null，否则返回中文 error。
+ *
+ * 为什么必须在主进程校验：渲染层拿到的 baseUrl 可能被 MCP / 控制台调用者
+ * 间接改到，而「正文发往第三方」是不可逆的隐私事故 —— 校验必须落在真正
+ * 发请求的那一侧。
+ */
+function checkLocalEmbedding(baseUrl) {
+  let host = ''
+  try {
+    host = new URL(String(baseUrl ?? '')).hostname
+  } catch {
+    return 'embedding 接口地址不合法，请填写完整地址（例如 http://localhost:11434/v1）'
+  }
+  if (!LOCAL_EMBED_HOSTS.includes(host.toLowerCase())) return EMBED_LOCAL_ONLY_ERROR
+  return null
+}
+
+/**
+ * 主进程代发一次 OpenAI 兼容的 `/embeddings`（Ollama / LM Studio 都吃这个形状）。
+ *
+ * 只回 `number[][]`：原始响应体一律不出口（与 toModelView 剥 key 同一条纪律）。
+ *
+ * **不发 Authorization 头**：端点已被强校验成环回地址，本机 Ollama / LM Studio
+ * 都是免密的；既然配置面只有端点与模型名两个键，也就不存在「密钥从哪来」的
+ * 问题 —— 少一条密钥存储路径，就少一处泄露面。
+ */
+async function embedTexts(texts) {
+  const cfg = getEmbeddingConfig()
+  const localError = checkLocalEmbedding(cfg.baseUrl)
+  if (localError) throw new Error(localError)
+
+  const url = joinUrl(cfg.baseUrl, '/embeddings')
+  const response = await fetch(url, {
+    method: 'POST',
+    // 头必须显式内联：顶层没有 `headers` 变量（其他 AI 调用写的是
+    // `headers: authHeaders(model)` 显式键），这里曾误用对象简写 `headers,`
+    // 引用未定义变量 → ReferenceError，向量检索永远降级、索引永远建不出
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: cfg.model, input: texts }),
+    signal: AbortSignal.timeout(AI_EMBED_TIMEOUT)
+  })
+  logAiCall('POST', url, response.status)
+  if (!response.ok) throw new Error(await readErrorDetail(response))
+
+  const json = await response.json().catch(() => null)
+  const list = Array.isArray(json?.data) ? json.data : []
+  if (!list.length) {
+    throw new Error('embedding 服务没有返回向量，请确认模型名是 embedding 模型（如 nomic-embed-text）')
+  }
+  // 按输入顺序回填：OpenAI 约定 data[i].index 是原始下标，个别网关不返该字段时
+  // 按返回顺序兜底 —— 顺序错了等于把 A 块的向量存到 B 块上，静默污染整个索引
+  const byIndex = new Array(texts.length)
+  let cursor = 0
+  for (const item of list) {
+    const raw = item?.embedding
+    if (!Array.isArray(raw) || !raw.length) continue
+    const index = Number.isFinite(item?.index) ? Number(item.index) : cursor
+    if (index >= 0 && index < texts.length) byIndex[index] = raw.map((n) => Number(n))
+    cursor += 1
+  }
+  const vectors = []
+  for (let i = 0; i < texts.length; i += 1) {
+    if (!byIndex[i]) throw new Error('embedding 服务返回的向量数量与输入不一致')
+    vectors.push(byIndex[i])
+  }
+  return vectors
+}
+
+/*
+ * 这里**故意不再注册 `ai:embed` IPC 通道**（曾注册过，已按队长裁决删除）。
+ *
+ * 理由：`src/types/ai.ts` 是「前端禁改」的跨进程契约红线文件，渲染层拿不到
+ * `embed` 的类型声明，preload 也就不能合法露出这条通道 —— 注册了必然是
+ * 「已注册无调用方」的死通道，徒增安全面。
+ *
+ * embedding 能力目前只由**主进程自己**消费（建索引 / 语义检索，见下方
+ * `kb:rebuild-index` 与 `kb:semantic-search`），配置走知识库偏好，因此没有
+ * 对外通道也完全可用。
+ *
+ * ⚠️ 若将来要把 embedding 对外暴露（例如给渲染层做「配置自检」按钮），
+ * **必须先获授权修改 `src/types/ai.ts`**（在 `AiApi` 里加签名），再按
+ * `ai:*` 的既有范式补 preload + 客户端。未经授权不得绕过红线。
+ */
+
+/* ------------------------------------------------------------------ */
 /* 知识库（kb:*）：sql.js 本机数据库的唯一 IPC 面                          */
 /*                                                                     */
 /* 形状照 ai:*：前置校验（参数形状 / 长度上限 / 必填）→ 失败中文 error；  */
@@ -1189,7 +1339,21 @@ ipcMain.handle('ai:image', async (_event, req) => {
 /** 文档大小上限：10MB（再大的文档应拆篇；sql.js 是全量导出式持久化） */
 const KB_DOC_MAX_BYTES = 10 * 1024 * 1024
 /** 偏好键白名单（与渲染层 PrefKey 一一对应） */
-const KB_PREF_KEYS = ['pref.chat_memory', 'pref.local_memory', 'pref.work_background']
+const KB_PREF_KEYS = [
+  'pref.chat_memory',
+  'pref.local_memory',
+  'pref.work_background',
+  // 语义检索（task-001）：本地 embedding 端点与模型名。配置面走偏好而不是
+  // config.json，正是为了「不新增 IPC、不动 src/types/ai.ts 红线」也能让用户配
+  'pref.embedding_base_url',
+  'pref.embedding_model'
+]
+/** 自由文本型偏好键：这几个不是 true/false 开关，不套开关值校验 */
+const KB_PREF_TEXT_KEYS = [
+  'pref.work_background',
+  'pref.embedding_base_url',
+  'pref.embedding_model'
+]
 
 /**
  * kb:* 统一包装：handler 内抛出的任何异常都归一成 {ok:false, error}，
@@ -1407,8 +1571,44 @@ kbHandle('kb:pick-doc', async () => {
   return { ok: true, canceled: false, path: result.filePaths[0] }
 })
 
+/**
+ * .docx 抽文本：优先 worker_threads，失败回落同步 extractDocxText。
+ *
+ * 为什么必须 worker：inflateRawSync + 全量 XML 正则扫描是同步重计算，放主进程
+ * 会霸占事件循环（10MB 档数百 ms~数秒，UI 无响应）；同步计算无法切片 yield，
+ * setTimeout 让步对它无效，挪出主线程是唯一正解（与 P0 方案评估一致）。
+ *
+ * 为什么留同步回落：asar 内等场景 worker 可能起不来（spawn 失败 / 进程崩溃 /
+ * 环境差异导致 worker 内模块加载失败）——功能不退化优先，同步路径是兜底，
+ * docx.cjs 对坏文件本就有完整中文错误。代价：worker 任何失败信号都会同步重跑
+ * 一遍，损坏文件会多解析一次（纯函数、结果一致），但功能永远可用。
+ */
+async function extractDocxTextViaWorker(filePath) {
+  let worker = null
+  try {
+    worker = new Worker(path.join(__dirname, 'kb', 'docx-worker.cjs'), { workerData: { filePath } })
+    return await new Promise((resolve, reject) => {
+      worker.on('message', (msg) => {
+        if (msg && msg.ok) resolve(msg.text)
+        else reject(new Error(msg?.error || 'docx 解析失败'))
+      })
+      // 进程级错误（脚本加载失败 / 未捕获异常 / OOM）：worker 机制本身不可用
+      worker.on('error', reject)
+      // 异常退出或静默退出（没等到 message 就退了）：按不可用处理，防 Promise 永挂
+      worker.on('exit', (code) => {
+        reject(new Error(code === 0 ? 'docx worker 未返回结果' : `docx worker 异常退出（code ${code}）`))
+      })
+    })
+  } catch {
+    // 回落：读盘 + 抽取都在主进程同步跑——最坏退回 worker 化之前的行为
+    return extractDocxText(fs.readFileSync(filePath))
+  } finally {
+    if (worker) worker.terminate().catch(() => {})
+  }
+}
+
 /** 读取文档内容（两段式第二段）：后缀白名单 + 10MB 上限 + 防目录穿越 */
-kbHandle('kb:read-doc', (payload) => {
+kbHandle('kb:read-doc', async (payload) => {
   const raw = typeof payload === 'string' ? payload : payload?.path
   const pathErr = kbCheckString(raw, 'path', { required: true, max: 1000 })
   if (pathErr) return { ok: false, error: pathErr }
@@ -1421,22 +1621,27 @@ kbHandle('kb:read-doc', (payload) => {
   }
   let stat
   try {
-    stat = fs.statSync(resolved)
+    // 异步 stat + 读前拦截：10MB 上限在读文件之前就拦掉，不搞「读完才拒」。
+    // 口径说明：read 阶段按字节 10MB，create 阶段按字符 200 万（kb:create-doc）；
+    // 10MB 中文文档约 330 万字符会越过后者，读前拦能让用户立刻看到拆分指引，
+    // 而不是白等整个读取时间后才看到费解的参数超长错误。
+    stat = await fs.promises.stat(resolved)
   } catch {
     return { ok: false, error: '文件不存在或无法读取' }
   }
   if (!stat.isFile()) return { ok: false, error: '选中的不是文件' }
   if (stat.size > KB_DOC_MAX_BYTES) {
-    return { ok: false, error: `文件过大（上限 ${Math.floor(KB_DOC_MAX_BYTES / 1024 / 1024)}MB），请拆分成更小的文档` }
+    return { ok: false, error: `文件超过 ${Math.floor(KB_DOC_MAX_BYTES / 1024 / 1024)}MB 上限，请拆分后上传` }
   }
   const format = ext.slice(1)
   const title = path.basename(resolved, ext)
   if (format === 'docx') {
-    return { ok: true, title, format, content: extractDocxText(fs.readFileSync(resolved)) }
+    // docx 抽文本走 worker（同步重计算挪出主进程），worker 不可用时回落同步
+    return { ok: true, title, format, content: await extractDocxTextViaWorker(resolved) }
   }
-  // utf-8 读取：剥 BOM（\uFEFF 会让锚点偏移量整体 +1）+ \r\n 归一
+  // utf-8 异步读取：剥 BOM（\uFEFF 会让锚点偏移量整体 +1）+ \r\n 归一
   // （存储内容的偏移量与 relocateAnchor 的归一化前提保持一致）
-  const content = fs.readFileSync(resolved, 'utf-8').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n')
+  const content = (await fs.promises.readFile(resolved, 'utf-8')).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n')
   return { ok: true, title, format, content }
 })
 
@@ -1599,9 +1804,18 @@ kbHandle('kb:set-preference', (payload) => {
   if (keyErr) return { ok: false, error: keyErr }
   const valueErr = kbCheckString(p.value, 'value', { required: true, max: 20000 })
   if (valueErr) return { ok: false, error: valueErr }
-  // 两个开关只接受 'true' / 'false'（工作背景是自由长文本）
-  if (p.key !== 'pref.work_background' && p.value !== 'true' && p.value !== 'false') {
+  // 开关类只接受 'true' / 'false'；工作背景与 embedding 两键是自由文本
+  if (!KB_PREF_TEXT_KEYS.includes(p.key) && p.value !== 'true' && p.value !== 'false') {
     return { ok: false, error: '开关值只能是 true / false' }
+  }
+  // embedding 端点多一道本机强校验：偏好是渲染层可写的，环回校验必须落在写入侧，
+  // 否则「先存一个外网地址、再由建索引时拒绝」会让用户看到莫名其妙的失败
+  if (p.key === 'pref.embedding_base_url') {
+    const localError = checkLocalEmbedding(p.value)
+    if (localError) return { ok: false, error: localError }
+  }
+  if (p.key === 'pref.embedding_model' && !p.value.trim()) {
+    return { ok: false, error: 'embedding 模型名不能为空' }
   }
   kbStore.kbSetPreference(p.key, p.value)
   return { ok: true }
@@ -1644,6 +1858,266 @@ kbHandle('kb:import-all', (payload) => {
   const counts = kbStore.kbImportAll(data)
   return { ok: true, ...counts }
 })
+
+/* ---- 语义检索（向量索引；无本地 embedding 时**明说**降级到关键词） ---- */
+
+/** 语义检索默认返回条数 / 上限 */
+const VEC_SEARCH_DEFAULT_LIMIT = 10
+const VEC_SEARCH_MAX_LIMIT = 50
+/** 默认相似度下限：低于这个分数的块基本是噪声，不如直接落到关键词 */
+const VEC_SEARCH_DEFAULT_MIN_SCORE = 0.2
+/** 索引为空时的降级提示 */
+const VEC_EMPTY_NOTICE = '语义索引为空（尚未建立本地 embedding 索引）'
+
+/** 数字夹取：IPC 传来的可能是 NaN / 越界值，一律收进合法区间 */
+function clampNumber(value, min, max, fallback) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(max, Math.max(min, n))
+}
+
+/**
+ * 尝试一次语义检索。**永不抛异常**：返回 `{ok:true, hits}` 或 `{ok:false, reason}`，
+ * 由调用方决定「给向量结果」还是「明说降级到关键词」。
+ */
+async function tryVectorSearch(query, limit, minScore, refTypes) {
+  try {
+    await vecStore.initVecStore()
+  } catch (err) {
+    return { ok: false, reason: `语义索引不可用（${err?.message || String(err)}）` }
+  }
+  if (!vecStore.isVecReady()) return { ok: false, reason: '语义索引不可用' }
+  if (vecStore.count() === 0) return { ok: false, reason: VEC_EMPTY_NOTICE }
+
+  const localError = checkLocalEmbedding(getEmbeddingConfig().baseUrl)
+  if (localError) return { ok: false, reason: localError }
+
+  let vectors
+  try {
+    vectors = await embedTexts([query])
+  } catch (err) {
+    return { ok: false, reason: `本地 embedding 服务未响应（${normalizeFetchError(err)}）` }
+  }
+  // 多取一些再按 refId 去重：同一条目可能有多块命中，只留最好的那块
+  const hits = vecStore.searchTopK(new Float32Array(vectors[0]), {
+    k: limit * 3,
+    minScore,
+    refTypes
+  })
+  if (!hits.length) return { ok: false, reason: '语义索引里没有相似度达标的块' }
+  return { ok: true, hits }
+}
+
+kbHandle('kb:semantic-search', async (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const qErr = kbCheckString(p.query, 'query', { required: true, max: 200 })
+  if (qErr) return { ok: false, error: qErr }
+  const query = String(p.query).trim()
+  const limit = Math.trunc(clampNumber(p.limit, 1, VEC_SEARCH_MAX_LIMIT, VEC_SEARCH_DEFAULT_LIMIT))
+  const minScore = clampNumber(p.minScore, -1, 1, VEC_SEARCH_DEFAULT_MIN_SCORE)
+  const refTypes = Array.isArray(p.refTypes)
+    ? p.refTypes.filter((t) => vecStore.REF_TYPES.includes(t))
+    : null
+
+  const vec = await tryVectorSearch(query, limit, minScore, refTypes)
+  if (vec.ok) {
+    const entries = []
+    const docs = []
+    const seenEntries = new Set()
+    const seenDocs = new Set()
+    for (const hit of vec.hits) {
+      if (hit.refType === 'entry') {
+        if (seenEntries.has(hit.refId)) continue
+        // 条目可能已被删除而向量还没清：跳过而不是抛错（检索永远不该炸）
+        const entry = kbStore.kbGetEntry(hit.refId)
+        if (!entry) continue
+        seenEntries.add(hit.refId)
+        entries.push(entry)
+        if (entries.length >= limit) break
+      } else if (hit.refType === 'doc') {
+        if (seenDocs.has(hit.refId) || docs.length >= limit) continue
+        const doc = kbStore.kbGetDoc(hit.refId)
+        if (!doc) continue
+        seenDocs.add(hit.refId)
+        // 只回 id / 标题 / 分数：正文要另外 docGet（向量库不冗余正文，省一半磁盘）
+        docs.push({ id: doc.id, title: doc.title, score: Number(hit.score.toFixed(4)) })
+      }
+    }
+    return { ok: true, mode: 'vector', entries, docs }
+  }
+
+  // 降级：**明说**这是关键词结果，绝不伪造向量分数。
+  // 理由（调查报告最强的一条负面建议）：哈希 / 关键词产出的「假向量」与语义
+  // embedding 不在同一向量空间，混进余弦只会让分数变成噪声，看起来有分其实
+  // 是随机排序 —— 宁可降级，也不要伪装成语义。
+  return {
+    ok: true,
+    mode: 'keyword',
+    notice: `${vec.reason}，当前为关键词检索结果`,
+    entries: kbStore.kbSearchEntries(query, limit),
+    docs: []
+  }
+})
+
+/**
+ * 重建索引的运行态。**后台跑而非 await**：一次全量重建在本地 CPU 上可能要
+ * 几分钟，而 MCP → 渲染层的 invokeRenderer 有 30s 超时，抱着等必然超时。
+ * 所以这里只「点火」并立刻回报，进度走 kb:index-status 轮询。
+ */
+let rebuildJob = null
+/** 最近一次重建的结果快照：UI 要展示「上次重建」而不是只看到「进行中」 */
+let lastRebuildReport = null
+
+kbHandle('kb:index-status', async () => {
+  // 索引库起不来也要能看状态：失败按空索引报，让 UI 有东西可显示
+  try {
+    await vecStore.initVecStore()
+  } catch {
+    /* 状态通道永不因初始化失败而炸 */
+  }
+  const cfg = getEmbeddingConfig()
+  const localError = checkLocalEmbedding(cfg.baseUrl)
+  const modelInfo = vecStore.describeModel()
+  return {
+    ok: true,
+    ready: vecStore.isVecReady(),
+    total: vecStore.count(),
+    byRefType: vecStore.countByRefType(),
+    model: modelInfo.model,
+    dim: modelInfo.dim,
+    lastBuiltAt: vecStore.lastUpdatedAt(),
+    building: !!rebuildJob,
+    progress: rebuildJob ? { ...rebuildJob } : null,
+    lastRebuild: lastRebuildReport ? { ...lastRebuildReport } : null,
+    embedding: {
+      baseUrl: cfg.baseUrl,
+      model: cfg.model,
+      // 只回「是否通过本机校验」与中文原因：apiKey 绝不回传渲染层
+      ready: !localError,
+      error: localError ?? ''
+    }
+  }
+})
+
+kbHandle('kb:rebuild-index', async (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  if (rebuildJob) return { ok: false, error: '重建索引正在进行中，请稍后查看状态' }
+  if (!kbStore.isKbReady()) return { ok: false, error: '知识库尚未就绪，请稍候重试' }
+  const localError = checkLocalEmbedding(getEmbeddingConfig().baseUrl)
+  if (localError) return { ok: false, error: localError }
+  if (p.full === true) {
+    // 手动整库重建：先清空（换模型后旧向量不可比，必须全丢）
+    try {
+      await vecStore.initVecStore()
+      vecStore.clearAll()
+    } catch {
+      /* 清空失败不阻断：下面增量流程照跑 */
+    }
+  }
+  void runRebuildIndex()
+  return { ok: true, started: true }
+})
+
+/** 后台重建：增量（内容没变的块不重新 embedding）+ 失败不清库 */
+async function runRebuildIndex() {
+  const cfg = getEmbeddingConfig()
+  rebuildJob = {
+    startedAt: Date.now(),
+    scanned: 0,
+    indexed: 0,
+    skipped: 0,
+    failed: 0,
+    capped: false,
+    error: ''
+  }
+  try {
+    await vecStore.initVecStore()
+
+    /* 1) 收集待索引来源：知识条目 + 文档（记忆太短，整体语义最强，不切块入库） */
+    const sources = []
+    for (const entry of kbStore.kbListEntries()) {
+      sources.push({ refType: 'entry', refId: entry.id, text: `标题：${entry.title}\n${entry.content ?? ''}` })
+    }
+    for (const doc of kbStore.kbListDocs()) {
+      const full = kbStore.kbGetDoc(doc.id)
+      if (!full) continue
+      sources.push({ refType: 'doc', refId: full.id, text: `标题：${full.title}\n${full.content ?? ''}` })
+    }
+
+    /* 2) 清孤儿：主库已删、向量库还在的行 */
+    const alive = new Set(sources.map((s) => `${s.refType}:${s.refId}`))
+    for (const ref of vecStore.listRefs()) {
+      if (!alive.has(`${ref.refType}:${ref.refId}`)) vecStore.clearForRef(ref.refType, ref.refId)
+    }
+
+    /* 3) 切块 + 按 contentHash 判重，只把「新增 / 变过」的块送进 embedding */
+    const pending = []
+    for (const source of sources) {
+      if (pending.length >= VEC_REBUILD_MAX_CHUNKS) {
+        rebuildJob.capped = true
+        break
+      }
+      const chunks = vecStore.chunkText(source.text)
+      const existing = vecStore.getRefIndex(source.refType, source.refId)
+      // 块数变少（文档被删章节）：删掉多出来的尾巴
+      if (chunks.length < existing.size) vecStore.trimRefFrom(source.refType, source.refId, chunks.length)
+      for (let i = 0; i < chunks.length; i += 1) {
+        if (pending.length >= VEC_REBUILD_MAX_CHUNKS) {
+          rebuildJob.capped = true
+          break
+        }
+        rebuildJob.scanned += 1
+        const hash = vecStore.contentHash(chunks[i])
+        const prev = existing.get(i)
+        // 内容没变 + 还是同一个模型 → 跳过（换模型则整块重算，因为向量空间不可比）
+        if (prev && prev.contentHash === hash && prev.model === cfg.model) {
+          rebuildJob.skipped += 1
+          continue
+        }
+        pending.push({
+          refType: source.refType,
+          refId: source.refId,
+          chunkIndex: i,
+          contentHash: hash,
+          text: chunks[i]
+        })
+      }
+    }
+
+    /* 4) 分批 embedding：串行（本地服务并发反而更慢），失败只丢这一批之后的部分 */
+    for (let i = 0; i < pending.length; i += EMBED_BATCH_SIZE) {
+      const batch = pending.slice(i, i + EMBED_BATCH_SIZE)
+      let vectors
+      try {
+        vectors = await embedTexts(batch.map((b) => b.text))
+      } catch (err) {
+        // 服务中断：已建好的块保留，缺口下次重建再补（**失败不清库**）
+        rebuildJob.failed += batch.length
+        rebuildJob.error = normalizeFetchError(err)
+        break
+      }
+      const dim = vectors[0]?.length ?? 0
+      vecStore.upsertChunks(
+        batch.map((b, j) => ({
+          ...b,
+          model: cfg.model,
+          dim,
+          vec: new Float32Array(vectors[j])
+        }))
+      )
+      rebuildJob.indexed += batch.length
+    }
+
+    // 收尾落盘一次：中途靠防抖，避免每批都重写几十 MB 文件
+    vecStore.flushNow()
+  } catch (err) {
+    rebuildJob.error = err?.message || String(err) || '重建索引失败'
+  } finally {
+    rebuildJob.finishedAt = Date.now()
+    lastRebuildReport = rebuildJob
+    rebuildJob = null
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* MCP：stdio 桥接实例（--mcp）与 GUI 实例的本地控制服务器                            */
@@ -1792,6 +2266,13 @@ function flushKbSafe() {
     kbStore.flushNow()
   } catch (err) {
     console.error('[kb] 强制落盘失败：', err?.message ?? String(err))
+  }
+  // 向量库同样要在退出前补一次落盘（它是独立 db 文件，防抖窗口里可能有
+  // 刚建完的索引）。失败同样只记日志：向量可由内容重算，绝不挡退出。
+  try {
+    vecStore.flushNow()
+  } catch (err) {
+    console.error('[vec] 强制落盘失败：', err?.message ?? String(err))
   }
 }
 

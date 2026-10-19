@@ -27,6 +27,7 @@ import { useFlowStore } from '@/stores/useFlowStore'
 import { useUiStore } from '@/stores/useUiStore'
 import { useAiStore } from '@/stores/useAiStore'
 import { useKbStore } from '@/stores/useKbStore'
+import { useConsistencyStore } from '@/stores/useConsistencyStore'
 import type { KnowledgeType, NodeLinks } from '@/core/kb/types'
 import TagInput from '@/components/common/TagInput.vue'
 import AiContextMenu from '@/components/common/AiContextMenu.vue'
@@ -48,6 +49,7 @@ const store = useFlowStore()
 const ui = useUiStore()
 const ai = useAiStore()
 const kbStore = useKbStore()
+const consistency = useConsistencyStore()
 
 const node = computed<StoryNode | null>(() => store.currentNode)
 
@@ -114,6 +116,10 @@ const wordCount = computed(() =>
 const donePercent = computed(() =>
   totalNodes.value ? Math.round((doneCount.value / totalNodes.value) * 100) : 0
 )
+
+/* ---------------- 一致性（消费 useConsistencyStore 的最近一次检查快照） ---------------- */
+/** 当前节点的问题列表；报告未跑过时 issuesFor 返回空数组 ⇒ 节点态不渲染问题块（不占位、不提示） */
+const nodeIssues = computed(() => (node.value ? consistency.issuesFor(node.value.id) : []))
 
 /* ---------------- 写操作 ---------------- */
 function update(patch: Partial<StoryNode>): void {
@@ -378,6 +384,29 @@ function addFirst(): void {
               <span class="nf-inspector__stat-num">{{ wordCount.toLocaleString() }}</span>
               <span class="nf-inspector__stat-label">字数</span>
             </div>
+            <!-- 一致性：整格可点，跳到控制台一致性面板；未检查时弱化提示 -->
+            <button
+              class="nf-inspector__stat nf-inspector__stat--cons"
+              type="button"
+              title="打开一致性检查"
+              @click="ui.openControlCenter('consistency')"
+            >
+              <span class="nf-inspector__cons-line">
+                <template v-if="consistency.report">
+                  <span class="nf-cons-item is-error">
+                    <i class="nf-cons-dot" /><span class="nf-cons-num">{{ consistency.report.counts.error }}</span>冲突
+                  </span>
+                  <span class="nf-cons-item is-warn">
+                    <i class="nf-cons-dot" /><span class="nf-cons-num">{{ consistency.report.counts.warn }}</span>提醒
+                  </span>
+                  <span class="nf-cons-item is-info">
+                    <i class="nf-cons-dot" /><span class="nf-cons-num">{{ consistency.report.counts.info }}</span>待补
+                  </span>
+                </template>
+                <span v-else class="nf-inspector__cons-empty">未检查</span>
+              </span>
+              <span class="nf-inspector__stat-label">一致性</span>
+            </button>
           </div>
           <p class="nf-inspector__hint">选中画布上的任意节点即可编辑它的属性与正文。</p>
           <div class="nf-inspector__empty-actions">
@@ -405,6 +434,23 @@ function addFirst(): void {
             placeholder="未命名节点"
             @change="onText('title', $event)"
           />
+        </div>
+
+        <!-- 一致性问题：仅当最近一次检查命中该节点时出现；未跑检查时完全不占位（避免噪音） -->
+        <div v-if="nodeIssues.length" class="nf-inspector__cons">
+          <span class="nf-inspector__cons-title">一致性问题</span>
+          <div
+            v-for="issue in nodeIssues"
+            :key="issue.id"
+            class="nf-inspector__cons-item"
+            :class="`is-${issue.severity}`"
+          >
+            <i class="nf-cons-dot" />
+            <div class="nf-inspector__cons-body">
+              <p class="nf-inspector__cons-msg">{{ issue.message }}</p>
+              <p v-if="issue.hint" class="nf-inspector__cons-hint">{{ issue.hint }}</p>
+            </div>
+          </div>
         </div>
 
         <ATabs class="nf-inspector__tabs" size="small">
@@ -734,6 +780,111 @@ function addFirst(): void {
   letter-spacing: 0.08em;
   color: var(--nf-on-dark-faint);
 }
+
+/* ---------------- 一致性：总览格 + 节点问题块 ---------------- */
+/* 总览格：与其它统计格同 chrome，通栏放置 + 整格可点（跳控制台一致性面板） */
+.nf-inspector__stat--cons {
+  grid-column: 1 / -1;
+  appearance: none;
+  font: inherit;
+  text-align: left;
+  /* Chromium UA 给 button 设了 align-items: center，会盖掉统计格 flex 列布局的
+     stretch 默认值，通栏格内容被水平居中；flex 子项不受 text-align 管辖，须显式重置 */
+  align-items: stretch;
+  cursor: pointer;
+  transition:
+    border-color var(--nf-dur-fast) var(--nf-ease),
+    background var(--nf-dur-fast) var(--nf-ease);
+}
+.nf-inspector__stat--cons:hover {
+  border-color: var(--nf-teal);
+  background: color-mix(in srgb, var(--nf-teal) 7%, var(--nf-shell-700));
+}
+.nf-inspector__cons-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: var(--nf-fs-xs);
+  color: var(--nf-on-dark-soft);
+}
+.nf-inspector__cons-empty {
+  color: var(--nf-on-dark-faint);
+  opacity: 0.72;
+}
+.nf-cons-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+.nf-cons-num {
+  font-size: var(--nf-fs-sm);
+  font-weight: 700;
+  color: var(--nf-on-dark-strong);
+  font-variant-numeric: tabular-nums;
+}
+.nf-cons-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+}
+.nf-cons-item.is-error .nf-cons-dot,
+.nf-inspector__cons-item.is-error .nf-cons-dot {
+  background: var(--nf-danger);
+}
+.nf-cons-item.is-warn .nf-cons-dot,
+.nf-inspector__cons-item.is-warn .nf-cons-dot {
+  background: var(--nf-gold);
+}
+.nf-cons-item.is-info .nf-cons-dot,
+.nf-inspector__cons-item.is-info .nf-cons-dot {
+  background: var(--nf-teal);
+}
+
+/* 节点问题块：紧凑列表，严重级色点 + message + hint（弱化小字） */
+.nf-inspector__cons {
+  margin: 10px 14px 0;
+  padding: 10px 12px;
+  border-radius: var(--nf-r-card-sm);
+  background: var(--nf-shell-700);
+  border: 1px solid var(--nf-shell-line-soft);
+}
+.nf-inspector__cons-title {
+  display: block;
+  font-size: var(--nf-fs-2xs);
+  letter-spacing: 0.08em;
+  color: var(--nf-on-dark-faint);
+  margin-bottom: 6px;
+}
+.nf-inspector__cons-item {
+  display: flex;
+  gap: 8px;
+  padding: 6px 0;
+}
+.nf-inspector__cons-item + .nf-inspector__cons-item {
+  border-top: 1px solid var(--nf-shell-line-soft);
+}
+.nf-inspector__cons-item .nf-cons-dot {
+  margin-top: 5px;
+}
+.nf-inspector__cons-body {
+  min-width: 0;
+}
+.nf-inspector__cons-msg {
+  margin: 0;
+  font-size: var(--nf-fs-xs);
+  line-height: 1.6;
+  color: var(--nf-on-dark);
+}
+.nf-inspector__cons-hint {
+  margin: 2px 0 0;
+  font-size: var(--nf-fs-2xs);
+  line-height: 1.6;
+  color: var(--nf-on-dark-faint);
+  opacity: 0.72;
+}
+
 .nf-inspector__hint {
   margin: 14px 14px 0;
   font-size: var(--nf-fs-2xs);

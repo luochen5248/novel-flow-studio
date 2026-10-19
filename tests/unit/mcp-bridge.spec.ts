@@ -225,10 +225,10 @@ describe('server · stdio 端到端（假管道 + 假控制客户端）', () => 
     expect(stdoutRaw.split('\n').filter(Boolean)).toHaveLength(2)
   })
 
-  it('E4 tools/list：46 个工具', async () => {
+  it('E4 tools/list：49 个工具', async () => {
     send({ jsonrpc: '2.0', id: 3, method: 'tools/list' })
     const res = await nextResponse(2)
-    expect(res.result.tools).toHaveLength(46)
+    expect(res.result.tools).toHaveLength(49)
     expect(res.result.tools.map((t: { name: string }) => t.name)).toContain('novelflow_add_node')
   })
 

@@ -3,6 +3,7 @@ dist
 dist-ssr
 release
 .agent-runs
+reports
 .workbuddy
 .DS_Store
 *.local

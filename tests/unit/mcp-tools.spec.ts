@@ -1,7 +1,7 @@
 /**
  * mcp-tools.spec.ts —— 工具注册表单测
  *
- * 覆盖：46 工具注册完整性（字段/唯一性/方法都在 NovelFlow 白名单）、
+ * 覆盖：49 工具注册完整性（字段/唯一性/方法都在 NovelFlow 白名单）、
  * 各工具参数校验（必填/枚举/长度/批量上限）、方法映射（args 形状）、
  * 不可序列化方法（exportPNG / download / subscribe）的拦截。
  *
@@ -21,10 +21,10 @@ const {
 } = require('../../electron/mcp/tools.cjs')
 
 describe('注册表完整性', () => {
-  it('T1 恰好 46 个工具，名称唯一', () => {
-    expect(TOOLS).toHaveLength(46)
+  it('T1 恰好 49 个工具，名称唯一', () => {
+    expect(TOOLS).toHaveLength(49)
     const names = TOOLS.map((t: { name: string }) => t.name)
-    expect(new Set(names).size).toBe(46)
+    expect(new Set(names).size).toBe(49)
   })
 
   it('T2 每个工具都有中文 description 与 object 型 inputSchema', () => {
@@ -37,7 +37,7 @@ describe('注册表完整性', () => {
 
   it('T3 listTools 只外露 name/description/inputSchema（不泄露 parse）', () => {
     const list = listTools()
-    expect(list).toHaveLength(46)
+    expect(list).toHaveLength(49)
     for (const item of list) {
       expect(Object.keys(item).sort()).toEqual(['description', 'inputSchema', 'name'])
     }
@@ -53,7 +53,7 @@ describe('注册表完整性', () => {
   })
 
   it('T5 白名单覆盖 aiApi 全部 35 方法（含 3 个不可序列化）', () => {
-    expect(NOVELFLOW_METHODS).toHaveLength(55)
+    expect(NOVELFLOW_METHODS).toHaveLength(58)
     expect(NON_SERIALIZABLE_METHODS).toEqual(['exportPNG', 'download', 'subscribe'])
   })
 })

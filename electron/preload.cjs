@@ -9,6 +9,9 @@
  *  - 知识库相关：条目 / 节点关联 / 文档 / 锚点 / 记忆 / 偏好 / 事件 /
  *    全量导入导出（userData/novelflow.db，sql.js）；只透传方法调用，
  *    不暴露 db 路径、export() 原始字节与任意 SQL。
+ *  - 语义检索相关：语义检索 / 索引状态 / 重建索引（向量在**独立**的
+ *    userData/novelflow-vectors.db；embedding 只走本机服务，密钥与原始响应
+ *    同样不出主进程）。
  * 其余 Node 能力一律不暴露。
  */
 const { contextBridge, ipcRenderer } = require('electron')
@@ -103,7 +106,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     curate: () => ipcRenderer.invoke('kb:curate'),
     /** 全量导入导出（JSON 备份） */
     exportAll: () => ipcRenderer.invoke('kb:export-all'),
-    importAll: (json) => ipcRenderer.invoke('kb:import-all', { json })
+    importAll: (json) => ipcRenderer.invoke('kb:import-all', { json }),
+    /** 语义检索（向量索引；无本地 embedding 时主进程明说降级为关键词结果） */
+    semanticSearch: (query, opts) => ipcRenderer.invoke('kb:semantic-search', { query, ...(opts ?? {}) }),
+    /** 语义索引状态：块数 / 模型 / 维度 / 最近重建时间 / 本地 embedding 是否就绪 */
+    indexStatus: () => ipcRenderer.invoke('kb:index-status'),
+    /** 触发后台重建索引（立即返回 {ok, started}，进度查 indexStatus） */
+    rebuildIndex: (opts) => ipcRenderer.invoke('kb:rebuild-index', opts ?? {})
   },
 
   /* ---- MCP 调用桥：主进程控制服务器 ↔ 渲染层 window.NovelFlow ---- */

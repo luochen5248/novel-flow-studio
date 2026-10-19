@@ -34,6 +34,8 @@ import * as idb from './kbIdb'
 
 /** 浏览器态（无 electronAPI.kb）的统一提示 */
 export const KB_BROWSER_HINT = '知识库仅在桌面端可用（浏览器开发模式不支持）'
+/** 浏览器态没有向量库（语义索引依赖主进程 sql.js），统一中文提示 */
+export const KB_VEC_BROWSER_HINT = '语义检索仅在桌面端可用（浏览器开发模式没有本地向量库）'
 
 /** AI 注入时最多带几条知识条目（注入块另有字符预算，双保险） */
 const KB_INJECT_LIMIT = 5
@@ -295,6 +297,60 @@ export async function setPreference(key: PrefKey, value: string): Promise<boolea
   return true
 }
 
+/* ---------------- 本地 embedding 配置（复用偏好通道） ---------------- */
+
+/**
+ * 本地 embedding 的两个偏好键（与 `electron/main.cjs` 的 `PREF_EMBEDDING_*`
+ * 同源；主进程侧键名白名单在 `KB_PREF_KEYS`）。
+ *
+ * 为什么配置走**偏好**而不是新增 IPC：`src/types/ai.ts` 是「前端禁改」的跨进程
+ * 契约红线，preload 不能新增通道；而 `kb:get-preferences` / `kb:set-preference`
+ * 早在 task-002 就有类型声明。这是唯一「一个字都不动红线、用户还能在界面里配」
+ * 的路径。
+ *
+ * 维度（dim）刻意不配：由首次 embedding 返回的向量长度自动推断 —— 用户手填容易
+ * 错，且换模型就失效。
+ */
+export const PREF_EMBEDDING_BASE_URL = 'pref.embedding_base_url'
+export const PREF_EMBEDDING_MODEL = 'pref.embedding_model'
+
+export interface EmbeddingConfig {
+  baseUrl: string
+  model: string
+}
+
+/** 缺省本机预设（与 `electron/main.cjs` 的 `EMBED_DEFAULT_*` 同源） */
+export const EMBEDDING_DEFAULT: EmbeddingConfig = {
+  baseUrl: 'http://localhost:11434/v1',
+  model: 'nomic-embed-text'
+}
+
+/** 读本地 embedding 配置（没配过就回报本机预设，与 main.cjs 同口径） */
+export async function getEmbeddingConfig(): Promise<EmbeddingConfig> {
+  const prefs = await getPreferences()
+  return {
+    baseUrl: String(prefs[PREF_EMBEDDING_BASE_URL] ?? '').trim() || EMBEDDING_DEFAULT.baseUrl,
+    model: String(prefs[PREF_EMBEDDING_MODEL] ?? '').trim() || EMBEDDING_DEFAULT.model
+  }
+}
+
+/**
+ * 写本地 embedding 配置（只写传进来的字段；端点留空表示恢复本机预设）。
+ *
+ * 断言说明：这两个键还不在 `PrefKey` 联合类型里（`src/core/kb/types.ts` 不在
+ * 本次授权范围），故此处显式断言。安全性不依赖类型 —— 主进程侧有键名白名单 +
+ * 环回 hostname 强校验，写外网地址会被中文错误直接挡回。
+ */
+export async function setEmbeddingConfig(patch: Partial<EmbeddingConfig>): Promise<boolean> {
+  const next: Array<[string, string]> = []
+  if (typeof patch.baseUrl === 'string') next.push([PREF_EMBEDDING_BASE_URL, patch.baseUrl.trim()])
+  if (typeof patch.model === 'string') next.push([PREF_EMBEDDING_MODEL, patch.model.trim()])
+  for (const [key, value] of next) {
+    await setPreference(key as PrefKey, value)
+  }
+  return true
+}
+
 /* ---------------- 工作过程事件 ---------------- */
 
 export async function listEvents(limit = 100): Promise<KbEvent[]> {
@@ -336,6 +392,117 @@ export async function importAll(json: string): Promise<{ entries: number; docume
     documents: r.documents ?? 0,
     memories: r.memories ?? 0
   }
+}
+
+/* ---------------- 语义检索（向量索引） ---------------- */
+
+/**
+ * 语义检索的返回形状。
+ *
+ * `mode` 是**不能省**的字段：'vector' = 真的走了向量；'keyword' = 已明说降级
+ * 到关键词（见 notice）。调用方必须能区分二者 —— 把降级结果伪装成语义结果
+ * 是最坏的一种「假成功」。
+ */
+export interface SemanticSearchResult {
+  ok: boolean
+  mode?: 'vector' | 'keyword'
+  /** 降级 / 提示说明（中文，直接给用户看） */
+  notice?: string
+  entries?: KnowledgeEntry[]
+  /** 命中的文档：向量库不冗余正文，只回 id / 标题 / 分数，正文另走 getDoc */
+  docs?: Array<{ id: string; title: string; score: number }>
+  error?: string
+}
+
+export interface SemanticSearchOptions {
+  limit?: number
+  /** 相似度下限（-1 ~ 1），缺省由主进程决定 */
+  minScore?: number
+  /** 限定来源类型，缺省全部 */
+  refTypes?: Array<'entry' | 'doc' | 'memory'>
+}
+
+export interface KbIndexStatus {
+  ok: boolean
+  ready?: boolean
+  total?: number
+  byRefType?: Record<string, number>
+  model?: string
+  dim?: number
+  lastBuiltAt?: number | null
+  building?: boolean
+  progress?: Record<string, unknown> | null
+  lastRebuild?: Record<string, unknown> | null
+  embedding?: { baseUrl: string; model: string; ready: boolean; error: string }
+  error?: string
+}
+
+export interface KbRebuildResult {
+  ok: boolean
+  started?: boolean
+  error?: string
+}
+
+/**
+ * 语义检索三件套在 preload 上的形状。
+ *
+ * 为什么不写进 `src/types/ai.ts` 的 `KbApi`：那个文件头注释「前端禁改」是
+ * 硬红线（折中方案的代价），跨进程契约里没有这三个方法的签名。所以这里在
+ * kbClient 内部做**局部扩展**，字段名与 preload.cjs 新增的三个透传一一对应；
+ * 将来 M2 若放开改契约，把这层就地删掉即可，调用方无需变动。
+ */
+interface KbVecBridge {
+  semanticSearch: (query: string, opts?: SemanticSearchOptions) => Promise<SemanticSearchResult>
+  indexStatus: () => Promise<KbIndexStatus>
+  rebuildIndex: (opts?: { full?: boolean }) => Promise<KbRebuildResult>
+}
+
+/** 取语义检索桥；浏览器态明确抛中文提示（绝不静默假成功） */
+function vecBridge(): KbVecBridge {
+  const api = (window as unknown as { electronAPI?: { kb?: unknown } }).electronAPI?.kb as
+    | (KbApi & Partial<KbVecBridge>)
+    | undefined
+  if (!api?.semanticSearch) throw new Error(KB_VEC_BROWSER_HINT)
+  return api as unknown as KbVecBridge
+}
+
+/**
+ * 语义检索。
+ *
+ * 降级契约：本地 embedding 未配置 / 服务不可达 / 索引为空时，主进程返回
+ * `mode:'keyword'` + 中文 notice，结果就是现有关键词检索的产物。**这里不做
+ * 任何「假向量」兜底** —— 哈希 / 关键词向量与语义 embedding 不在同一空间，
+ * 混进余弦只会产出看起来有分、实际是噪声的排序。
+ */
+export async function semanticSearch(
+  query: string,
+  opts: SemanticSearchOptions = {}
+): Promise<SemanticSearchResult> {
+  const q = String(query ?? '').trim()
+  if (!q) throw new Error('语义检索关键词不能为空')
+  const r = await vecBridge().semanticSearch(q, opts)
+  unwrap(r, '语义检索失败')
+  return {
+    ok: true,
+    mode: r.mode ?? 'keyword',
+    notice: r.notice ?? '',
+    entries: r.entries ?? [],
+    docs: r.docs ?? []
+  }
+}
+
+/** 语义索引状态（块数 / 模型 / 维度 / 最近重建 / 本地 embedding 是否就绪） */
+export async function indexStatus(): Promise<KbIndexStatus> {
+  const r = await vecBridge().indexStatus()
+  unwrap(r, '读取语义索引状态失败')
+  return r
+}
+
+/** 触发后台重建索引（立即返回；进度查 indexStatus） */
+export async function rebuildIndex(opts: { full?: boolean } = {}): Promise<KbRebuildResult> {
+  const r = await vecBridge().rebuildIndex(opts)
+  unwrap(r, '重建语义索引失败')
+  return { ok: true, started: r.started === true }
 }
 
 /* ---------------- AI 注入便捷方法 ---------------- */

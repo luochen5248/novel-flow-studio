@@ -22,6 +22,14 @@ export const useUiStore = defineStore('ui', () => {
   const connecting = ref<{ source: string; x: number; y: number } | null>(null)
   /** 当前选中的连线 id（快捷键删边 / Esc 清选中都要读它，故放 store 而非组件本地态） */
   const selectedEdgeId = ref<string | null>(null)
+  /**
+   * 控制中心外部打开意图：外部入口（NodeInspector 的「一致性」格）想直接跳到
+   * 控制中心某个面板时先写这里，由 ControlCenter 的 watch 负责消费。
+   * null = 无意图。刻意不复用弹窗内的 activeKey：意图可能早于弹窗打开产生，
+   * 需要独立信箱缓存，否则「没开弹窗时点的跳转」会丢。
+   * 联合类型随 ControlCenter 的专属面板分支扩展。
+   */
+  const controlCenterPanel = ref<'memory' | 'consistency' | null>(null)
 
   const canvasTheme = computed<CanvasMode>(() => {
     const mode = flow.activeGraph?.settings.canvasMode
@@ -98,6 +106,11 @@ export const useUiStore = defineStore('ui', () => {
     selectedEdgeId.value = null
   }
 
+  /** 外部跳转控制中心，可指定落在哪个面板（缺省 = 默认第一项） */
+  function openControlCenter(panel?: 'memory' | 'consistency'): void {
+    controlCenterPanel.value = panel ?? null
+  }
+
   function notify(message: string): void {
     flow.lastMessage = message
   }
@@ -116,6 +129,7 @@ export const useUiStore = defineStore('ui', () => {
     devConsoleOpen,
     connecting,
     selectedEdgeId,
+    controlCenterPanel,
     toggleTheme,
     setCanvasMode,
     toggleCanvasMode,
@@ -129,6 +143,7 @@ export const useUiStore = defineStore('ui', () => {
     closeDevConsole,
     selectEdge,
     clearEdgeSelection,
+    openControlCenter,
     notify
   }
 })

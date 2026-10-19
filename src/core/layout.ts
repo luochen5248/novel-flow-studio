@@ -136,9 +136,22 @@ export function layoutTimeline(graph: FlowGraph): FlowGraph {
     if (lane === mainLane) continue
     const list = sortStable(byLane.get(lane) as StoryNode[])
     list.sort((a, b) => {
-      const pa = parentTravel.get(a.id) ?? a.order
-      const pb = parentTravel.get(b.id) ?? b.order
-      return pa - pb || a.order - b.order || (a.id < b.id ? -1 : 1)
+      const pa = parentTravel.get(a.id)
+      const pb = parentTravel.get(b.id)
+      // 【F-2 · 单位必须一致】parentTravel 存的是父节点的**像素**行进坐标，
+      // 而 `a.order` 只是 0..n-1 的**序号**。原实现 `?? a.order` 把两种单位混着比，
+      // 后果是「有跨 lane 父边的支线节点」永远被排到没有父边的节点之后 ——
+      // 示例故事 lane=1 的 b1（父锚定在 s2 下方）被挤到最后一位，支线顺序整个反过来，
+      // 连带让 b1 → b2 这条 flow 边变成「连线方向与排列顺序相反」。
+      // 修正：没有像素锚点的节点不参与像素比较（也不能拿序号冒充像素），
+      // 统一按「有锚点者优先（它的位置由父节点决定）、无锚点者彼此按 order」排，
+      // order 相同再用 id 兜底，结果稳定可复现。
+      if (pa !== undefined && pb !== undefined) {
+        return pa - pb || a.order - b.order || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+      }
+      if (pa !== undefined) return -1
+      if (pb !== undefined) return 1
+      return a.order - b.order || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
     })
 
     let prevEnd = -Infinity

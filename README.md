@@ -141,12 +141,13 @@ asar，桥接文件必须在 asar 之外）。发布走 GitHub Actions——推�
 
 对 AI 说：「唤醒小说时间线工坊，新建故事线《锚点》，添加三个节点：雨夜初遇 / 旧账 / 抉择」——软件窗口自动弹出，节点上线并自动串联。
 
-工具（46 个）：`wake` / `status` / `help` / `list_flows` / `add_flow` / `open_flow` /
+工具（49 个）：`wake` / `status` / `help` / `list_flows` / `add_flow` / `open_flow` /
 `remove_flow` / `rename_flow` / `get_state` / `add_node` / `add_nodes` / `update_node` /
 `remove_node` / `add_edge` / `remove_edge` / `update_edge` / `add_note` / `add_character` /
 `add_tag` / `set_status` / `set_chapter` / `batch` / `undo` / `redo` / `export` /
 `api`（白名单内任意 NovelFlow 方法的逃生门）/ `kb_add_entry` / `kb_update_entry` /
-`kb_remove_entry` / `kb_list_entries` / `kb_search` / `kb_link_node` / `kb_unlink_node` /
+`kb_remove_entry` / `kb_list_entries` / `kb_search` / `kb_semantic_search` /
+`kb_index_status` / `kb_rebuild_index` / `kb_link_node` / `kb_unlink_node` /
 `kb_list_node_links` / `doc_add` / `doc_list` / `doc_get` / `doc_update` / `doc_remove` /
 `doc_anchor` / `doc_link_node` / `doc_unlink_node` / `memory_add` / `memory_list` /
 `memory_update` / `memory_remove`。资源：`novelflow://flows`、`novelflow://outline`。
@@ -169,10 +170,69 @@ asar，桥接文件必须在 asar 之外）。发布走 GitHub Actions——推�
   检索失败则静默跳过，绝不阻断主链
 - **记忆与进化**：控制中心「记忆与进化」面板可沉淀写作偏好与工作背景、回顾 AI 协助
   历史；两个开关默认关闭，打开后才记录工作过程事件
-- **MCP 暴露**：新增 20 个知识库工具（`kb_*` / `doc_*` / `memory_*`），见上方「工具（46 个）」
+- **语义检索（0.5.2 新增）**：知识条目与文档可建**本地语义索引**（向量存独立的
+  `userData/novelflow-vectors.db`）；embedding **只走本机 Ollama / LM Studio**
+  （默认 `http://localhost:11434/v1`；端点与模型在知识库面板的索引状态行里配置，
+  存本机知识库偏好，**正文绝不发往第三方**）；未配置 / 服务不可用时**明说降级为
+  关键词检索**，绝不用「假向量」凑数；索引状态（块数 / 模型 / 维度 / 最近重建）
+  与「重建索引」按钮同在该行，换过模型可全量重算
+- **MCP 暴露**：新增 23 个知识库工具（`kb_*` / `doc_*` / `memory_*`），见上方「工具（49 个）」
 - **资料库式改版（0.5.1）**：知识库面板重做为资料库式大面板——左栏搜索 + 分区导航（知识条目 /
   参考文档 / 作者记忆）+ 最近访问；右栏列表（名称 / 类型 / 位置 / 最近访问）+ 右上角「上传文档 /
   新建条目」入口；并修复早期版本「打开知识库无响应、无法上传文件」的问题
+
+### 用 WorkBuddy 等 AI 管理知识库
+
+接入配置同上方「MCP 接入」的**形态 B**（正式安装版 0.4.1 起，安装目录自带 `mcp/`，`mcp.json`
+指向 `<安装目录>\mcp\standalone.cjs`，保存后到「连接器管理 → 自定义连接器」点「信任」）。
+知识库相关工具共 23 个（`kb_*` / `doc_*` / `memory_*`，见上方「工具（49 个）」），全部经界面
+同一条 store 通路执行：改动可见、可 `Ctrl+Z`、数据落 `userData/novelflow.db`。
+
+能做什么：
+
+- **读**：`kb_search`（关键词搜索，返回条目全文）/ `kb_list_entries` / `kb_list_node_links`
+  （按节点反查关联的条目与文档）/ `doc_list`（列全部文档）/ `doc_get`（读文档全文）/ `memory_list`
+- **语义检索**：`kb_semantic_search`（向量召回，返回条目全文 + 命中文档 id；结果里
+  `mode="keyword"` 表示本机 embedding 不可用、已降级为关键词检索，附中文说明）/
+  `kb_index_status`（查索引块数、模型、维度、最近重建时间、本机 embedding 是否就绪）/
+  `kb_rebuild_index`（后台重建索引，立即返回；换过模型给 `full:true` 全量重算）
+- **写**：`kb_add_entry`（条目 ≤2 万字符）/ `doc_add`（**带文档全文直接入库，≤20 万字符**，
+  AI 生成内容入库就走它）/ `memory_add`（≤2000 字符）
+- **改删**：`kb_update_entry` / `kb_remove_entry` / `doc_update` / `doc_remove` /
+  `memory_update` / `memory_remove`
+- **关联**：`kb_link_node` / `kb_unlink_node` / `doc_link_node` / `doc_unlink_node` /
+  `doc_anchor`（给一段文字即可在文档内自动模糊定位建成锚点，定位不到会明确报错，绝不存错位锚点）
+
+做不到的：
+
+- **没有「AI 整理」类工具**：整理动作 = AI 自己读出来（`kb_search` / `doc_get` / `memory_list`）
+  → 在 AI 侧归纳 → 再写回（`kb_add_entry` / `doc_add` / `memory_add`）
+- **不能让 AI 上传本地文件**：上传走界面「上传文档」按钮（对话框 + 读文件都在主进程）；
+  AI 只能把内容以文本形式 `doc_add` 进来
+- 单次写入有硬上限（条目 2 万 / 文档 20 万 / 记忆 2000 字符），超大文档需拆篇多次 `doc_add`
+
+示例指令（直接对 WorkBuddy 说）：
+
+1. **存条目**：「用 kb_add_entry 存一条人物设定：标题『沈砚』，类型 character，content『……』」
+2. **查重后存**：「先 kb_search 搜『沈砚』把结果念给我；没有重复再用 kb_add_entry 存这条：……」
+3. **带全文建文档**：「用 doc_add 把下面全文存进知识库，标题《第三卷大纲》，format 用 md：……」+ 粘贴全文
+
+### 时间线一致性检查（0.5.2 新增）
+
+控制中心新增「故事检查 → 一致性检查」：对当前故事线跑一遍**纯本地规则**，
+把冲突与遗漏摆到桌面上——不猜、不联网、不读正文：
+
+- **13 条纯规则默认开**：悬空连线、顺序连线逆序、章节号重复、已成稿却无正文、
+  支线未收束、空字段（标题 / 时间 / 摘要 / 章节）、人物与角色牌对不上等；
+  年份只在两端都能解析时才比较（时间标签是自由文本，抽不出年份就跳过，不误报），
+  跨支线不比顺序，人物卡按角色牌语义豁免部分规则
+- **8 条 AI 语义项预留、默认关**：如跨支线并行冲突、人物动机断裂等需要 LLM 判定的
+  检查；面板里可勾选登记，当前不真正调用 AI（接入模型后开放）
+- **三处落点**：① 控制台「一致性检查」面板（打开即算，严重级计数 + 问题列表，
+  点问题选中并跳到对应节点）；② 画布节点卡右上角角标（有问题才亮，悬浮看详情）；
+  ③ 属性检查器「画布总览」的一致性格（三计数，点击直达检查面板）
+- **快照语义**：检查在打开面板 / 点「重新检查」时现算，不随编辑自动重算——
+  纯函数便宜到随手可跑，但跟着自动保存的防抖跑会让列表反复抖动
 
 ## 快速开始（开发）
 
@@ -205,7 +265,7 @@ electron/
   assets/             app-icon.png（运行时窗口图标 256²）· tray-icon.png（托盘图标 32²）
   preload.cjs        contextBridge 最小安全面（更新 / AI / MCP IPC）
   control-server.cjs GUI 实例本地控制服务器（127.0.0.1 + Bearer token + 心跳刷新）
-  mcp/               MCP stdio 桥：protocol（JSON-RPC 帧）· tools（46 工具注册表）·
+  mcp/               MCP stdio 桥：protocol（JSON-RPC 帧）· tools（49 工具注册表）·
                       control-client（HTTP 客户端）· wake（唤醒）· server（stdio 组装）·
                       standalone（独立桥接进程入口，打包态生产通路；经 extraFiles
                       投放为安装目录下的 mcp/）

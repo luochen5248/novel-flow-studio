@@ -33,21 +33,31 @@ import {
   createEntry,
   createMemory,
   getDoc,
+  indexStatus,
   linkDoc,
   linkEntry,
   listDocs,
   listEntries,
   listLinksForNode,
   listMemories,
+  rebuildIndex,
   removeDoc,
   removeEntry,
   removeMemory,
   searchEntries,
+  semanticSearch,
   unlinkDoc,
   unlinkEntry,
   updateDoc,
   updateEntry,
   updateMemory
+} from './kbClient'
+// 语义检索的返回形状（kbClient 里定义，避免 aiApi 再长出第二份同名字段）
+import type {
+  KbIndexStatus,
+  KbRebuildResult,
+  SemanticSearchOptions,
+  SemanticSearchResult
 } from './kbClient'
 // 锚点模糊重定位：docAnchor 用 quote 在文档内容里现定位偏移量（与 UI 划词建锚点同一算法）
 import { relocateAnchor } from '@/core/kb/anchor'
@@ -249,6 +259,12 @@ export interface NovelFlowApi {
   kbLinkNode(entryId: string, nodeId: string): Promise<ApiResult<boolean>>
   kbUnlinkNode(entryId: string, nodeId: string): Promise<ApiResult<boolean>>
   kbListNodeLinks(nodeId: string): Promise<ApiResult<NodeLinks>>
+  /** 语义检索（向量）；无本地 embedding 时返回 mode:'keyword' 并附中文降级说明 */
+  kbSemanticSearch(query: string, opts?: SemanticSearchOptions): Promise<ApiResult<SemanticSearchResult>>
+  /** 语义索引状态：块数 / 模型 / 维度 / 最近重建 / 本地 embedding 是否就绪 */
+  kbIndexStatus(): Promise<ApiResult<KbIndexStatus>>
+  /** 触发后台重建索引（立即返回 {started:true}，进度查 kbIndexStatus） */
+  kbRebuildIndex(opts?: { full?: boolean }): Promise<ApiResult<KbRebuildResult>>
 
   docAdd(input: CreateDocInput): Promise<ApiResult<KbDocument>>
   docList(): Promise<ApiResult<KbDocument[]>>
@@ -1303,6 +1319,40 @@ async function kbListNodeLinks(nodeId: string): Promise<ApiResult<NodeLinks>> {
   return kbCall(() => listLinksForNode(n))
 }
 
+/* ---------------- 语义检索（task-001） ---------------- */
+
+/**
+ * 语义检索。
+ *
+ * 与 kbSearch 的分工：kbSearch 是关键词（LIKE 预筛 + 相关性精排），这里是
+ * 向量召回。返回体里 `mode` 必须原样透给 AI —— 'keyword' 表示已降级，
+ * 附带的 notice 是给用户看的中文说明。**不为凑数伪造向量分数**。
+ */
+async function kbSemanticSearch(query: string, opts?: SemanticSearchOptions): Promise<ApiResult<SemanticSearchResult>> {
+  const q = String(query ?? '').trim()
+  if (!q) return fail('kbSemanticSearch 失败：检索词不能为空')
+  const safe: SemanticSearchOptions = {}
+  if (opts && typeof opts === 'object') {
+    if (Number.isFinite(opts.limit)) safe.limit = Math.min(50, Math.max(1, Math.trunc(opts.limit as number)))
+    if (Number.isFinite(opts.minScore)) safe.minScore = Math.min(1, Math.max(-1, Number(opts.minScore)))
+    if (Array.isArray(opts.refTypes)) {
+      const types = opts.refTypes.filter((t) => t === 'entry' || t === 'doc' || t === 'memory')
+      if (types.length) safe.refTypes = types
+    }
+  }
+  return kbCall(() => semanticSearch(q, safe))
+}
+
+/** 语义索引状态 */
+async function kbIndexStatus(): Promise<ApiResult<KbIndexStatus>> {
+  return kbCall(() => indexStatus())
+}
+
+/** 触发后台重建索引 */
+async function kbRebuildIndex(opts?: { full?: boolean }): Promise<ApiResult<KbRebuildResult>> {
+  return kbCall(() => rebuildIndex(opts && opts.full === true ? { full: true } : {}))
+}
+
 async function docAdd(input: CreateDocInput): Promise<ApiResult<KbDocument>> {
   const title = String(input?.title ?? '').trim()
   if (!title) return fail('docAdd 失败：文档标题不能为空')
@@ -1537,6 +1587,9 @@ const HELP_LIST: HelpItem[] = [
   { name: 'kbLinkNode', signature: 'kbLinkNode(entryId, nodeId)', desc: '把知识条目关联到节点（写故事时可被检索注入）' },
   { name: 'kbUnlinkNode', signature: 'kbUnlinkNode(entryId, nodeId)', desc: '解除知识条目与节点的关联' },
   { name: 'kbListNodeLinks', signature: 'kbListNodeLinks(nodeId)', desc: '反查节点关联的全部知识条目与文档' },
+  { name: 'kbSemanticSearch', signature: 'kbSemanticSearch(query, opts?)', desc: '语义检索（向量召回；结果里 mode="keyword" 表示本地 embedding 不可用、已降级为关键词检索，notice 是中文说明）' },
+  { name: 'kbIndexStatus', signature: 'kbIndexStatus()', desc: '语义索引状态：已索引块数 / 模型 / 维度 / 最近重建时间 / 本地 embedding 是否就绪' },
+  { name: 'kbRebuildIndex', signature: 'kbRebuildIndex({full?})', desc: '后台重建语义索引（立即返回，进度查 kbIndexStatus）；full=true 先清空再全量重算' },
   { name: 'docAdd', signature: 'docAdd({title, format?, content})', desc: '新建文档（md / txt / docx 纯文本直接入库）' },
   { name: 'docList', signature: 'docList()', desc: '列出全部文档（不含正文）' },
   { name: 'docGet', signature: 'docGet(id)', desc: '读取文档全文（含 content）' },
@@ -1612,6 +1665,9 @@ export const api: NovelFlowApi = {
   kbLinkNode,
   kbUnlinkNode,
   kbListNodeLinks,
+  kbSemanticSearch,
+  kbIndexStatus,
+  kbRebuildIndex,
   docAdd,
   docList,
   docGet,

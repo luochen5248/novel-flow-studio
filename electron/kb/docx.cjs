@@ -108,7 +108,11 @@ function decodeXmlEntities(text) {
         body[1] === 'x' || body[1] === 'X'
           ? Number.parseInt(body.slice(2), 16)
           : Number.parseInt(body.slice(1), 10)
-      return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : match
+      // 码点守卫：越界码点（> 0x10FFFF，或 NaN）时原样保留实体文本，不进
+      // String.fromCodePoint——越界会抛未捕获 RangeError，击穿 docx.cjs 既有
+      // 的中文错误引导，让用户看到一句裸英文异常；与「未知实体原样保留」的
+      // 哲学一致（正常 Word 产物不触发，只防损坏/恶意构造的 docx）
+      return Number.isFinite(code) && code > 0 && code <= 0x10FFFF ? String.fromCodePoint(code) : match
     }
     const named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }
     return named[body] ?? match

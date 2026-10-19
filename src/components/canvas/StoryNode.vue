@@ -4,6 +4,7 @@ import type { StoryNode } from '@/types/graph'
 import { STATUS_LABEL, KIND_LABEL } from '@/types/graph'
 import NodeHandles from './NodeHandles.vue'
 import { mountedNodes } from '@/core/characterRename'
+import { useConsistencyStore } from '@/stores/useConsistencyStore'
 
 const props = withDefaults(
   defineProps<{
@@ -36,6 +37,8 @@ const emit = defineEmits<{
   (e: 'rename-character', id: string, name: string): void
 }>()
 
+const consistency = useConsistencyStore()
+
 const hovered = ref(false)
 const renaming = ref(false)
 const renameDraft = ref('')
@@ -49,6 +52,13 @@ const statusClass = computed(() => `is-${props.node.status}`)
 const enterDelay = computed(() => `${Math.min(props.index, 24) * 30}ms`)
 /** 人物卡片：更窄、clay 色系、走另一套内部排版，视觉上明显区别于事件卡 */
 const isCharacter = computed(() => props.node.kind === 'character')
+
+/**
+ * 一致性角标数据：最近一次检查命中该节点的问题（byNode 已按严重级降序，[0] 即最严重那条）。
+ * 检查是快照语义（打开控制台一致性项 / 点重新检查才跑），没跑过时 byNode 是空对象
+ * ⇒ 角标不显示，属预期行为。
+ */
+const nodeIssues = computed(() => consistency.byNode[props.node.id] ?? [])
 
 /**
  * 人物行的折叠标签：超过 3 人时不给卡片塞一串名字（角色牌已经够挤），
@@ -229,6 +239,14 @@ function cancelRename(): void {
           </template>
 
           <span v-if="node.image?.url" class="nf-card__image-flag" title="已配插图" />
+
+          <!-- 一致性角标：最近一次检查发现该节点有问题才亮；纯视觉 + 悬浮看详情，不带数字 -->
+          <span
+            v-if="nodeIssues.length"
+            class="nf-card__cons-flag"
+            :class="`is-${nodeIssues[0].severity}`"
+            :title="nodeIssues.map((i) => i.message).join('　')"
+          />
 
           <!-- 就地改名浮层：双击角色牌出现，覆盖整张卡，Esc 取消 / 回车或失焦提交 -->
           <div
@@ -475,6 +493,30 @@ function cancelRename(): void {
   border-radius: 999px;
   background: var(--nf-teal);
   box-shadow: 0 0 0 3px var(--nf-teal-mist);
+}
+
+/* 一致性角标：右上角内缘，与右下角的 image-flag 错开；三色 = 暖红 / 琥珀 / 青。
+   定位基准是 position:relative 的 .nf-card（foreignObject 不参与包含块计算），
+   8px 内缘落在 18px 大圆角的弧线内侧，不会被 overflow:hidden 裁掉。 */
+.nf-card__cons-flag {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+}
+.nf-card__cons-flag.is-error {
+  background: var(--nf-danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--nf-danger) 22%, transparent);
+}
+.nf-card__cons-flag.is-warn {
+  background: var(--nf-gold);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--nf-gold) 22%, transparent);
+}
+.nf-card__cons-flag.is-info {
+  background: var(--nf-teal);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--nf-teal) 22%, transparent);
 }
 
 /* ---------- 选中：主色 2px 描边 + 8px 外发光 ---------- */

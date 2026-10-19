@@ -1,7 +1,7 @@
 /**
  * NovelFlow MCP · 工具注册表
  *
- * 46 个工具全部是 window.NovelFlow.*（src/api/aiApi.ts）的薄壳：
+ * 49 个工具全部是 window.NovelFlow.*（src/api/aiApi.ts）的薄壳：
  * 本文件只做「参数校验 + 方法映射」，不碰业务；执行在 server.cjs /
  * control-server.cjs / 渲染层完成。
  *
@@ -25,6 +25,8 @@ const NOVELFLOW_METHODS = [
   // 知识库 / 文档 / 记忆（task-002 新增；全部走 kbClient，桌面态 IPC、浏览器态 IDB）
   'kbAddEntry', 'kbUpdateEntry', 'kbRemoveEntry', 'kbListEntries', 'kbSearch',
   'kbLinkNode', 'kbUnlinkNode', 'kbListNodeLinks',
+  // 语义检索（task-001）：向量召回 / 索引状态 / 重建索引，全部走本机 embedding
+  'kbSemanticSearch', 'kbIndexStatus', 'kbRebuildIndex',
   'docAdd', 'docList', 'docGet', 'docUpdate', 'docRemove',
   'docAnchor', 'docLinkNode', 'docUnlinkNode',
   'memoryAdd', 'memoryList', 'memoryUpdate', 'memoryRemove'
@@ -608,6 +610,44 @@ const TOOLS = [
       const query = pickString(params, 'query', { required: true, max: 200 })
       if (!query.ok) return query
       return { ok: true, kind: 'method', method: 'kbSearch', args: [query.value] }
+    }
+  },
+  {
+    name: 'novelflow_kb_semantic_search',
+    description: '语义检索知识库（向量召回；本机 embedding 不可用时自动降级为关键词检索，结果里 mode 会标明）',
+    inputSchema: schema(
+      {
+        query: { type: 'string', description: '检索内容（整句提问比关键词更合适）' },
+        limit: { type: 'number', description: '返回条数，缺省 10，上限 50' },
+        minScore: { type: 'number', description: '相似度下限（-1 ~ 1），缺省 0.2' }
+      },
+      ['query']
+    ),
+    parse: (params) => {
+      const query = pickString(params, 'query', { required: true, max: 200 })
+      if (!query.ok) return query
+      const collected = collect([
+        ['limit', pickNumber(params, 'limit', { min: 1, max: 50 })],
+        ['minScore', pickNumber(params, 'minScore', { min: -1, max: 1 })]
+      ])
+      if (!collected.ok) return collected
+      return { ok: true, kind: 'method', method: 'kbSemanticSearch', args: [query.value, collected.value] }
+    }
+  },
+  {
+    name: 'novelflow_kb_index_status',
+    description: '查询语义索引状态：已索引块数 / embedding 模型 / 维度 / 最近重建时间 / 本机 embedding 是否就绪',
+    inputSchema: schema({}),
+    parse: () => ({ ok: true, kind: 'method', method: 'kbIndexStatus', args: [] })
+  },
+  {
+    name: 'novelflow_kb_rebuild_index',
+    description: '后台重建语义索引（立即返回，进度用 kb_index_status 查）；换过 embedding 模型请给 full=true 全量重算',
+    inputSchema: schema({ full: { type: 'boolean', description: 'true = 先清空再全量重算（换模型时必须）' } }),
+    parse: (params) => {
+      const full = pickBoolean(params, 'full')
+      if (!full.ok) return full
+      return { ok: true, kind: 'method', method: 'kbRebuildIndex', args: [full.value === true ? { full: true } : {}] }
     }
   },
   {

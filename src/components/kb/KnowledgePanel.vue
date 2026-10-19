@@ -35,6 +35,8 @@ import type {
 
 const flowStore = useFlowStore()
 const kbStore = useKbStore()
+/** 仅 Electron 桌面环境才显示依赖 electronAPI 的项（浏览器里走不了主进程；惯例同 ControlCenter） */
+const isDesktop = !!(window as unknown as { electronAPI?: unknown }).electronAPI
 
 /* ---------------- 弹窗骨架（照 ControlCenter） ---------------- */
 
@@ -140,6 +142,9 @@ watch(
   (value) => {
     if (value) {
       lastFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null
+      // embedding 草稿每次打开时从偏好重置：refresh() 是异步的，挂载那一刻
+      // preferences 可能还没回来；关闭期间的未保存编辑不保留（同条目编辑器预期）
+      syncEmbedDraft()
       window.addEventListener('keydown', onKeydown, true)
       window.addEventListener('keydown', onTrapKeydown, true)
       void nextTick(() => {
@@ -156,9 +161,13 @@ watch(
 
 onMounted(() => {
   void kbStore.refresh()
+  // 语义索引状态先拉一次：桌面态有向量库；浏览器态 kbClient 抛中文错，store 内置 null
+  void kbStore.refreshIndexStatusAction()
+  syncEmbedDraft()
 })
 
 onBeforeUnmount(() => {
+  stopIndexPoll()
   window.removeEventListener('keydown', onKeydown, true)
   window.removeEventListener('keydown', onTrapKeydown, true)
 })
@@ -173,6 +182,13 @@ function formatDate(ts: number): string {
   const d = new Date(ts)
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+/** 语义索引「最近重建」只到时分（同一天的多次重建用时分才分得开） */
+function formatTime(ts: number): string {
+  const d = new Date(ts)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
 const ENTRY_TYPE_LABEL: Record<KnowledgeType, string> = {
@@ -395,6 +411,30 @@ const docAnchors = ref<DocAnchor[]>([])
 /** 正文区最近一次划词（mouseup / keyup 时算；white-space: pre-wrap 保证 DOM 文本长 = 字符串长） */
 const pendingSelection = ref<{ start: number; end: number; quote: string } | null>(null)
 const docBody = ref<HTMLElement | null>(null)
+/** 上传中置位：「上传文档」按钮 loading + 禁用，防大文档读取/入库期间重复点击 */
+const uploading = ref(false)
+
+/**
+ * 查看器分块渲染：首块 5 万字符，「加载更多」每次 +5 万。
+ * 为什么分块：整篇做成单个大文本节点时，百万字符级文档一打开就要做全量布局/
+ * 绘制，主线程长时间占用（调查报告瓶颈 #2）。
+ * 关键安全性：渲染的是 content 的**连续前缀**——pre-wrap 下 DOM 文本长 = 字符串长，
+ * 划词建锚点的 pre.toString().length 偏移算法在已渲染区内仍然准确；未加载区
+ * 划不到属预期（进度文案提示用户先加载更多）。
+ */
+const DOC_CHUNK_CHARS = 50000
+/** 已加载字符数（切文档时重置为首块） */
+const docLoadedChars = ref(DOC_CHUNK_CHARS)
+/** content 在列表通道可能缺失（类型上可选），查看器里按空串兜底 */
+const visibleDocText = computed(() => currentDoc.value?.content?.slice(0, docLoadedChars.value) ?? '')
+/** 文档总字符数 */
+const docTotalChars = computed(() => currentDoc.value?.content?.length ?? 0)
+/** 是否还有未加载的后续段落（「加载更多」条与进度文案的显隐） */
+const docHasMore = computed(() => docLoadedChars.value < docTotalChars.value)
+
+function loadMoreDoc(): void {
+  docLoadedChars.value += DOC_CHUNK_CHARS
+}
 
 /** 上传入口：桌面态走 dialog 两段式；浏览器态只能 hidden input（md/txt） */
 async function onUploadDoc(): Promise<void> {
@@ -402,6 +442,7 @@ async function onUploadDoc(): Promise<void> {
     docFileInput.value?.click()
     return
   }
+  uploading.value = true
   try {
     const pick = await pickDoc()
     if (pick.canceled || !pick.path) return
@@ -410,6 +451,8 @@ async function onUploadDoc(): Promise<void> {
     message.success(`已导入《${doc.title}》`)
   } catch (e) {
     message.error(failText(e))
+  } finally {
+    uploading.value = false
   }
 }
 
@@ -417,6 +460,7 @@ async function onDocFile(e: Event): Promise<void> {
   const input = e.target as HTMLInputElement
   const file = input.files?.[0]
   if (!file) return
+  uploading.value = true
   try {
     const ext = file.name.split('.').pop()?.toLowerCase()
     const format: DocFormat = ext === 'md' ? 'md' : 'txt'
@@ -427,6 +471,7 @@ async function onDocFile(e: Event): Promise<void> {
   } catch (err) {
     message.error(failText(err))
   } finally {
+    uploading.value = false
     input.value = ''
   }
 }
@@ -435,6 +480,8 @@ async function onOpenDoc(id: string): Promise<void> {
   try {
     const doc = await getDoc(id)
     currentDoc.value = doc
+    // 重置分块：新文档从首块开始渲染，不继承上一篇的加载进度
+    docLoadedChars.value = DOC_CHUNK_CHARS
     docAnchors.value = doc ? await listAnchors({ docId: doc.id }) : []
     pendingSelection.value = null
   } catch (e) {
@@ -567,6 +614,108 @@ async function onRemoveMemory(id: string): Promise<void> {
     message.error(failText(e))
   }
 }
+
+/* ---------------- 语义索引状态 + embedding 配置 ---------------- */
+
+/** building 期间的状态轮询间隔：主进程后台跑重建，进度只能靠再查 index-status */
+const INDEX_POLL_MS = 1500
+let indexPollTimer: ReturnType<typeof setInterval> | null = null
+
+function stopIndexPoll(): void {
+  if (indexPollTimer) {
+    clearInterval(indexPollTimer)
+    indexPollTimer = null
+  }
+}
+
+/**
+ * 索引元信息行文案：total / model / dim 缺哪个省哪段，绝不显示 undefined。
+ * 三态分开：浏览器态没有主进程 → 明说暂不支持；桌面态首次拉取前 → 「读取中」
+ * （不能误显示成浏览器态提示，那是两种完全不同的环境）；取到后再拼元信息。
+ */
+const indexStatusText = computed(() => {
+  const s = kbStore.indexStatus
+  if (!isDesktop) return '浏览器态暂不支持语义索引'
+  if (!s) return '索引状态读取中…'
+  if (s.building) return '重建中…'
+  const parts: string[] = []
+  if (typeof s.total === 'number') parts.push(`语义索引 ${s.total} 块`)
+  if (s.model) parts.push(`模型 ${s.model}`)
+  if (typeof s.dim === 'number') parts.push(`维度 ${s.dim}`)
+  if (s.lastBuiltAt) parts.push(`最近重建 ${formatTime(s.lastBuiltAt)}`)
+  return parts.length ? parts.join(' · ') : '语义索引暂无数据'
+})
+
+/** embedding 未就绪时的弱化警示：主进程给的中文原文优先，其次固定降级说明 */
+const embeddingWarnText = computed(() => {
+  const emb = kbStore.indexStatus?.embedding
+  if (!emb || emb.ready !== false) return ''
+  return emb.error || '本地 embedding 未就绪：语义检索将降级为关键词'
+})
+
+/** 重建按钮禁用：building 中（浏览器态时按钮整个不渲染，见模板 v-if） */
+const rebuildDisabled = computed(() => kbStore.indexStatus?.building === true)
+
+async function onRebuildIndex(): Promise<void> {
+  try {
+    await kbStore.rebuildIndexAction()
+    message.success('已开始重建索引')
+  } catch (e) {
+    // 主进程拒绝（embedding 未就绪 / 正在重建中）时错误是中文，原样展示
+    message.error(failText(e))
+  }
+}
+
+/** embedding 配置草稿：偏好里存什么显示什么，缺省回落本机预设（与主进程同口径） */
+const embedBaseUrl = ref('')
+const embedModel = ref('')
+const embedSaving = ref(false)
+
+function syncEmbedDraft(): void {
+  embedBaseUrl.value = kbStore.preferences['pref.embedding_base_url'] || 'http://localhost:11434/v1'
+  embedModel.value = kbStore.preferences['pref.embedding_model'] || 'nomic-embed-text'
+}
+
+async function onSaveEmbedding(): Promise<void> {
+  const baseUrl = embedBaseUrl.value.trim()
+  const model = embedModel.value.trim()
+  if (!model) {
+    message.warning('embedding 模型名不能为空')
+    return
+  }
+  embedSaving.value = true
+  try {
+    // 两个键都走通用偏好通道；主进程对 base_url 有环回强校验，失败会中文上抛
+    await kbStore.setPreferenceAction('pref.embedding_base_url', baseUrl)
+    await kbStore.setPreferenceAction('pref.embedding_model', model)
+    message.success('已保存，重建索引后生效')
+    void kbStore.refreshIndexStatusAction()
+  } catch (e) {
+    message.error(failText(e))
+  } finally {
+    embedSaving.value = false
+  }
+}
+
+/**
+ * building 轮询：true 起表（1500ms 重查状态），false / undefined 停表。
+ * 只 watch building 标量本身——indexStatus 整对象每 1.5s 换一个新引用，
+ * deep watch 会把每轮轮询自己再触发一遍，纯属自返循环。started/stopped
+ * 由 onBeforeUnmount 的 stopIndexPoll 兜底，绝不泄漏 interval。
+ */
+watch(
+  () => kbStore.indexStatus?.building,
+  (building) => {
+    if (building) {
+      if (indexPollTimer) return
+      indexPollTimer = setInterval(() => {
+        void kbStore.refreshIndexStatusAction()
+      }, INDEX_POLL_MS)
+    } else {
+      stopIndexPoll()
+    }
+  }
+)
 </script>
 
 <template>
@@ -691,6 +840,7 @@ async function onRemoveMemory(id: string): Promise<void> {
                   v-else-if="section === 'docs'"
                   class="nf-kb__cta"
                   :title="`上传文档（支持 md / txt${hasKbBridge() ? ' / docx' : ''}）`"
+                  :disabled="uploading"
                   @click="onUploadDoc"
                 >
                   <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
@@ -703,7 +853,7 @@ async function onRemoveMemory(id: string): Promise<void> {
                       stroke-linejoin="round"
                     />
                   </svg>
-                  <span>上传文档</span>
+                  <span>{{ uploading ? '上传中…' : '上传文档' }}</span>
                 </button>
                 <button v-else class="nf-kb__cta" title="新建一条作者记忆" @click="focusMemoryInput">
                   <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
@@ -712,6 +862,48 @@ async function onRemoveMemory(id: string): Promise<void> {
                   <span>新建记忆</span>
                 </button>
               </header>
+              <!-- 语义索引状态 + embedding 配置：slim 横条，弱化元信息，不抢标题行视觉 -->
+              <div class="nf-kb__indexbar">
+                <div class="nf-kb__indexbar-row">
+                  <span
+                    class="nf-kb__indexbar-status"
+                    :class="{ 'is-warn': !!embeddingWarnText, 'is-dim': !kbStore.indexStatus }"
+                  >
+                    {{ indexStatusText }}
+                  </span>
+                  <span v-if="embeddingWarnText" class="nf-kb__indexbar-warn">{{ embeddingWarnText }}</span>
+                  <!-- 浏览器态（indexStatus 为 null）不显示重建按钮：点了也只会收到中文错误 -->
+                  <button
+                    v-if="kbStore.indexStatus"
+                    class="nf-kb__mini nf-kb__indexbar-rebuild"
+                    :disabled="rebuildDisabled"
+                    title="重建语义索引（后台运行，期间可继续别的操作）"
+                    @click="onRebuildIndex"
+                  >
+                    重建索引
+                  </button>
+                </div>
+                <!-- 配置行只在桌面态渲染：浏览器态没有主进程读这些偏好，留着就是不起作用的设置 -->
+                <div v-if="isDesktop" class="nf-kb__indexbar-row">
+                  <span class="nf-kb__indexbar-label nf-mono-label">embedding</span>
+                  <input
+                    v-model="embedBaseUrl"
+                    class="nf-kb__embed-input"
+                    placeholder="http://localhost:11434/v1"
+                    :disabled="embedSaving"
+                  />
+                  <input
+                    v-model="embedModel"
+                    class="nf-kb__embed-input nf-kb__embed-input--model"
+                    placeholder="nomic-embed-text"
+                    :disabled="embedSaving"
+                  />
+                  <button class="nf-kb__mini is-primary" :disabled="embedSaving" @click="onSaveEmbedding">
+                    {{ embedSaving ? '保存中…' : '保存' }}
+                  </button>
+                  <span class="nf-kb__indexbar-hint">仅支持本机 embedding 服务（Ollama / LM Studio）；填外部地址会被拒绝。</span>
+                </div>
+              </div>
               <div v-if="section === 'entries'" class="nf-kb__filters">
                 <button
                   class="nf-kb__chip"
@@ -879,11 +1071,21 @@ async function onRemoveMemory(id: string): Promise<void> {
                   </div>
                   <div
                     ref="docBody"
-                    v-text="currentDoc.content"
+                    v-text="visibleDocText"
                     class="nf-kb__doc nf-scroll"
                     @mouseup="onDocSelection"
                     @keyup="onDocSelection"
                   />
+                  <!-- 分块渲染的追加条：大文档首块只渲染 5 万字符，避免单文本节点全量布局卡死；
+                       渲染的是连续前缀，划词偏移算法在已渲染区内仍然准确 -->
+                  <div v-if="docHasMore" class="nf-kb__doc-more">
+                    <button class="nf-kb__mini" title="再加载 5 万字符（未加载的段落暂时划不到）" @click="loadMoreDoc">
+                      加载更多
+                    </button>
+                    <span class="nf-kb__doc-progress">
+                      已加载 {{ docLoadedChars }} / 共 {{ docTotalChars }} 字符（后续段落加载后才能划词）
+                    </span>
+                  </div>
                   <div class="nf-kb__anchors">
                     <p class="nf-kb__anchors-title">锚点（{{ docAnchors.length }}）</p>
                     <ul v-if="docAnchors.length" class="nf-kb__anchor-list nf-scroll">
@@ -983,6 +1185,8 @@ async function onRemoveMemory(id: string): Promise<void> {
             </div>
           </main>
         </div>
+        <!-- 底部弱化提示：AI 可经 MCP 检索与管理本知识库（配置与用法见 README「用 WorkBuddy 等 AI 管理知识库」） -->
+        <p class="nf-kb__foot">可通过 MCP 让 WorkBuddy 等 AI 检索与管理本知识库</p>
       </div>
     </div>
   </Teleport>
@@ -1110,6 +1314,9 @@ async function onRemoveMemory(id: string): Promise<void> {
   border-color: rgba(77, 208, 217, 0.45);
 }
 .nf-kb__nav-search::placeholder {
+  color: var(--nf-on-dark-faint);
+}
+.nf-kb__embed-input::placeholder {
   color: var(--nf-on-dark-faint);
 }
 .nf-kb__searchbar-icon {
@@ -1309,9 +1516,14 @@ async function onRemoveMemory(id: string): Promise<void> {
     filter var(--nf-dur-fast) var(--nf-ease),
     box-shadow var(--nf-dur-fast) var(--nf-ease);
 }
-.nf-kb__cta:hover {
+.nf-kb__cta:hover:not(:disabled) {
   filter: brightness(1.08);
   box-shadow: 0 0 0 3px rgba(77, 208, 217, 0.18);
+}
+/* 上传中：禁用 + 压暗（与 nf-kb__mini:disabled 同口径），防大文档读取期间重复点击 */
+.nf-kb__cta:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .nf-kb__filters {
@@ -1319,6 +1531,82 @@ async function onRemoveMemory(id: string): Promise<void> {
   flex-wrap: wrap;
   gap: 6px;
   padding: 4px 18px 0;
+}
+
+/* 语义索引状态行 + embedding 配置：slim 横条，弱化元信息 + 蓝青点缀，不撑布局 */
+.nf-kb__indexbar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 18px 8px;
+}
+.nf-kb__indexbar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.nf-kb__indexbar-status {
+  flex: none;
+  max-width: 62%;
+  font-size: var(--nf-fs-2xs);
+  color: var(--nf-on-dark-soft);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 浏览器态 / 无状态：整体弱化，不当作错误 */
+.nf-kb__indexbar-status.is-dim {
+  color: var(--nf-on-dark-faint);
+}
+/* embedding 未就绪：琥珀警示（主进程中文原文），不用红色那么重 */
+.nf-kb__indexbar-status.is-warn {
+  color: var(--nf-warn);
+}
+.nf-kb__indexbar-warn {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--nf-fs-2xs);
+  color: var(--nf-warn);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nf-kb__indexbar-rebuild {
+  margin-left: auto;
+  flex: none;
+}
+.nf-kb__indexbar-label {
+  flex: none;
+  color: var(--nf-teal);
+}
+.nf-kb__indexbar-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--nf-fs-2xs);
+  color: var(--nf-on-dark-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nf-kb__embed-input {
+  flex: none;
+  width: 180px;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: var(--nf-r-ctl);
+  border: 1px solid var(--nf-shell-line);
+  background: rgba(8, 14, 19, 0.4);
+  color: var(--nf-on-dark);
+  font-size: var(--nf-fs-2xs);
+}
+.nf-kb__embed-input--model {
+  width: 132px;
+}
+.nf-kb__embed-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* ---------------- 两栏布局（表格列表 / 编辑或查看） ---------------- */
@@ -1537,6 +1825,7 @@ async function onRemoveMemory(id: string): Promise<void> {
 .nf-kb__select:focus,
 .nf-kb__content:focus,
 .nf-kb__nav-search:focus,
+.nf-kb__embed-input:focus,
 .nf-kb__mem-edit:focus {
   outline: none;
   border-color: rgba(77, 208, 217, 0.45);
@@ -1636,6 +1925,19 @@ async function onRemoveMemory(id: string): Promise<void> {
 .nf-kb__doc ::selection {
   background: rgba(77, 208, 217, 0.32);
 }
+/* 分块渲染追加条：按钮 + 已加载/总量进度（弱化文案，不抢正文视觉） */
+.nf-kb__doc-more {
+  flex: none;
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.nf-kb__doc-progress {
+  font-size: var(--nf-fs-2xs);
+  color: var(--nf-on-dark-faint);
+  font-variant-numeric: tabular-nums;
+}
 .nf-kb__anchors {
   flex: none;
   margin-top: 10px;
@@ -1711,6 +2013,16 @@ async function onRemoveMemory(id: string): Promise<void> {
 .nf-kb__hint {
   flex: none;
   margin: 10px 0 0;
+  font-size: var(--nf-fs-2xs);
+  color: var(--nf-on-dark-faint);
+}
+
+/* ---------------- 面板底部弱化提示 ---------------- */
+.nf-kb__foot {
+  flex: none;
+  margin: 0;
+  padding: 8px 18px 10px;
+  border-top: 1px solid var(--nf-shell-line-soft);
   font-size: var(--nf-fs-2xs);
   color: var(--nf-on-dark-faint);
 }

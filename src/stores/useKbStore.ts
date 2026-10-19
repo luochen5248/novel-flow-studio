@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import * as kb from '@/api/kbClient'
+import type { KbIndexStatus } from '@/api/kbClient'
 import type {
   CreateAnchorInput,
   CreateDocInput,
@@ -13,6 +14,7 @@ import type {
   KnowledgeEntry,
   MemoryEntry,
   NodeLinks,
+  PrefKey,
   UpdateAnchorInput,
   UpdateDocInput,
   UpdateEntryInput,
@@ -51,6 +53,8 @@ export const useKbStore = defineStore('kb', () => {
   const preferences = ref<Record<string, string>>({})
   /** NodeInspector「关联」TabPane 的按节点反查结果 */
   const nodeLinks = ref<(NodeLinks & { nodeId: string }) | null>(null)
+  /** 语义索引状态（task-001）；null = 还没查到（浏览器态没有向量库，会保持 null） */
+  const indexStatus = ref<KbIndexStatus | null>(null)
   const loading = ref(false)
   const error = ref('')
 
@@ -138,6 +142,36 @@ export const useKbStore = defineStore('kb', () => {
 
   async function searchAction(query: string): Promise<KnowledgeEntry[]> {
     return kb.searchEntries(query)
+  }
+
+  /* ---------------- 语义检索 / 索引（task-001） ---------------- */
+
+  /**
+   * 读语义索引状态（块数 / 模型 / 维度 / 本机 embedding 是否就绪）。
+   * 状态是附属信息，绝不弹错：查询失败保留上次已知状态；从未读到过（浏览器态 /
+   * 主进程未就绪）才保持 null，让 UI 走既有的降级文案。
+   */
+  async function refreshIndexStatusAction(): Promise<void> {
+    try {
+      indexStatus.value = await kb.indexStatus()
+    } catch {
+      // 查询失败保留上次已知状态，不置 null：重建途中单次查询失败若清成 null，
+      // building 会变 undefined 让 KnowledgePanel 的 watch 停表，而起表只发生在
+      // building 由 false→true 的跳变上——没有任何路径再起表，主进程重建跑完后
+      // UI 会永远停在「读取中」。首次就是 null（浏览器态 / 主进程未就绪）时保持
+      // null，让 UI 走既有的降级文案。
+    }
+  }
+
+  /** 触发后台重建索引（立即返回；进度靠再查一次状态） */
+  async function rebuildIndexAction(full = false): Promise<void> {
+    await kb.rebuildIndex(full ? { full: true } : {})
+    await refreshIndexStatusAction()
+  }
+
+  /** 语义检索：降级时结果里 mode === 'keyword' 且带中文 notice，由调用方展示 */
+  async function semanticSearchAction(query: string): Promise<kb.SemanticSearchResult> {
+    return kb.semanticSearch(query)
   }
 
   /* ---------------- 节点关联 ---------------- */
@@ -246,6 +280,16 @@ export const useKbStore = defineStore('kb', () => {
     preferences.value = { ...preferences.value, 'pref.local_memory': value ? 'true' : 'false' }
   }
 
+  /**
+   * 通用偏好写入（embedding 两键走这里；主进程对 base_url 有环回校验，错误原样上抛）。
+   * key 收成 string：embedding 两个键还没进 PrefKey 联合（core/kb/types.ts 是跨进程
+   * 契约红线、不在授权范围），与 kbClient.setEmbeddingConfig 同口径显式断言。
+   */
+  async function setPreferenceAction(key: string, value: string): Promise<void> {
+    await kb.setPreference(key as PrefKey, value)
+    preferences.value = { ...preferences.value, [key]: value }
+  }
+
   let bgTimer: ReturnType<typeof setTimeout> | null = null
 
   function setWorkBackgroundDraft(text: string): void {
@@ -332,6 +376,7 @@ export const useKbStore = defineStore('kb', () => {
     events,
     preferences,
     nodeLinks,
+    indexStatus,
     loading,
     error,
     // 偏好
@@ -341,6 +386,7 @@ export const useKbStore = defineStore('kb', () => {
     workBackgroundDraft,
     setChatMemory,
     setLocalMemory,
+    setPreferenceAction,
     setWorkBackgroundDraft,
     saveWorkBackground,
     // 读取
@@ -351,6 +397,10 @@ export const useKbStore = defineStore('kb', () => {
     updateEntryAction,
     removeEntryAction,
     searchAction,
+    // 语义检索 / 索引
+    refreshIndexStatusAction,
+    rebuildIndexAction,
+    semanticSearchAction,
     // 关联
     linkEntryAction,
     unlinkEntryAction,

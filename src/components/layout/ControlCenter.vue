@@ -23,7 +23,10 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { useUiStore } from '@/stores/useUiStore'
 import { useKbStore } from '@/stores/useKbStore'
+import { useFlowStore } from '@/stores/useFlowStore'
+import { useConsistencyStore } from '@/stores/useConsistencyStore'
 import { downloadText } from '@/core/storage'
+import { CONSISTENCY_RULES, type ConsistencyIssue, type IssueSeverity } from '@/core/consistency'
 import type { MemoryEntry, MemoryType } from '@/core/kb/types'
 import UpdateDialog from '@/components/common/UpdateDialog.vue'
 import GrsaiKeyDialog from '@/components/common/GrsaiKeyDialog.vue'
@@ -31,6 +34,8 @@ import AiModelDialog from '@/components/common/AiModelDialog.vue'
 
 const ui = useUiStore()
 const kbStore = useKbStore()
+const flowStore = useFlowStore()
+const consistency = useConsistencyStore()
 
 /** 仅 Electron 桌面环境才显示依赖 electronAPI 的几项（浏览器里走不了主进程） */
 const isDesktop = !!(window as unknown as { electronAPI?: unknown }).electronAPI
@@ -72,8 +77,12 @@ interface SettingItem {
   /** 右栏主按钮文案 */
   actionLabel: string
   run: () => void
-  /** 右栏专属渲染分支（记忆与进化：开关 + 工作背景 + 管理区，不用标准 action 骨架） */
-  panel?: 'memory'
+  /**
+   * 右栏专属渲染分支（不用标准 action 骨架）：
+   *  - 'memory'：记忆与进化（开关 + 工作背景 + 管理区）
+   *  - 'consistency'：一致性检查（计数 + 问题列表 + AI 语义项开关）
+   */
+  panel?: 'memory' | 'consistency'
 }
 
 /**
@@ -96,6 +105,65 @@ function openKeyDialog(): void {
 function openUpdateDialog(): void {
   open.value = false
   updateDialog.value?.open()
+}
+
+/* ---------------- 一致性检查（右栏专属分支的状态与动作） ---------------- */
+
+/*
+ * 报告本身住在 useConsistencyStore（ControlCenter 写、StoryNode / NodeInspector 读，
+ * 三处共享同一份快照），这里只留本面板私有的展示态与动作。
+ *
+ * 为什么是「打开才跑」而不是 watch 图数据：persist 是 260ms 防抖、Inspector
+ * 的文本字段还有 300ms 防抖，跟着数据跑会在打字期间反复重算并让列表抖动；
+ * 而 O(n+e) 的检查便宜到可以「想看就现算」，所以只在打开本项与点「重新检查」时跑。
+ */
+
+/** 需要 LLM 的 8 条规则 —— UI 开关列表的数据源，默认全部关闭 */
+const aiRules = CONSISTENCY_RULES.filter((r) => r.needsAi)
+/** 用户打开了哪几条 AI 语义项（默认空 = 全关；本次只登记选择，不真调 AI） */
+const aiRuleOn = ref<Record<string, boolean>>({})
+
+/** 严重级 → 中文标签（计数行与色点共用一套文案） */
+const SEVERITY_LABEL: Record<IssueSeverity, string> = {
+  error: '冲突',
+  warn: '提醒',
+  info: '待补'
+}
+/** 计数行的展示顺序（与排序权重同序：冲突 → 提醒 → 待补） */
+const SEVERITY_ORDER: IssueSeverity[] = ['error', 'warn', 'info']
+
+// 注意：Pinia setup store 的属性在实例上是解包后的值（不是 ref），直接读、不写 .value
+const issueList = computed<ConsistencyIssue[]>(() => consistency.report?.issues ?? [])
+
+/** 报告时间（HH:MM）：checkedAt 是 epoch ms，toTimeString 前 5 字符即本地时分 */
+function checkedTimeOf(at: number): string {
+  return new Date(at).toTimeString().slice(0, 5)
+}
+
+/** 问题涉及的节点标题：按 nodeIds 查当前图，节点已被删则回落 id（悬空连线会走到） */
+function titlesOf(ids: string[]): string {
+  if (!ids.length) return '涉及节点已被删除'
+  return ids.map((id) => `「${flowStore.nodes.find((n) => n.id === id)?.title || id}」`).join('、')
+}
+
+/**
+ * 点问题项 → 关掉自己 + 选中这些节点 + 展开检查器。
+ *
+ * 先关自己的理由与本组件 openModelDialog 一致：本弹窗 950 层盖住整屏，
+ * 不关的话「选中」发生在遮罩背后，用户什么也看不到。
+ *
+ * ⚠️ 只做到「选中」这一层：把视口移到节点上要改 FlowCanvas（viewport 在它内部），
+ * 不在本次授权范围，故未接 —— 见实现报告的遗留问题。
+ */
+function onIssueClick(issue: ConsistencyIssue): void {
+  if (!issue.nodeIds.length) return
+  open.value = false
+  flowStore.select(issue.nodeIds)
+  ui.inspectorOpen = true
+}
+
+function onAiRuleChange(id: string, e: Event): void {
+  aiRuleOn.value = { ...aiRuleOn.value, [id]: (e.target as HTMLInputElement).checked }
 }
 
 /* ---------------- 记忆与进化（右栏专属分支的状态与动作） ---------------- */
@@ -335,6 +403,24 @@ const items = computed<SettingItem[]>(() => {
       actionLabel: '',
       panel: 'memory',
       run: () => {}
+    },
+    {
+      key: 'consistency',
+      group: '故事检查',
+      label: '一致性检查',
+      icon:
+        'M8 1.9 L13.3 3.6 V7.9 C13.3 10.9 11 12.8 8 14.1 C5 12.8 2.7 10.9 2.7 7.9 V3.6 Z M5.7 7.9 L7.4 9.6 L10.3 6.3',
+      title: '时间线一致性检查',
+      desc: '按 13 条纯规则扫一遍当前故事线：悬空连线、顺序连线逆序、章节号重复、已成稿却无正文、支线未收束、空字段、人物与角色牌对不上。全部本地计算，不读正文也不联网。',
+      state: consistency.report
+        ? issueList.value.length
+          ? `${consistency.report.counts.error} 处冲突 · ${consistency.report.counts.warn} 项提醒 · ${consistency.report.counts.info} 项待补`
+          : '没有发现问题'
+        : '打开后自动检查一次',
+      active: (consistency.report?.counts.error ?? 0) > 0,
+      actionLabel: '',
+      panel: 'consistency',
+      run: () => {}
     }
   )
 
@@ -415,8 +501,11 @@ function onTrapKeydown(e: KeyboardEvent): void {
 
 watch(open, (value) => {
   if (value) {
-    // 每次打开都回到第一项，不保留上次的选中态（设置项少，回到起点更好找）
-    activeKey.value = items.value[0]?.key ?? ''
+    // 每次打开都回到第一项，不保留上次的选中态（设置项少，回到起点更好找）；
+    // 外部跳转意图（NodeInspector「一致性」格写 ui.controlCenterPanel）优先消费，
+    // 读完立即清空，避免下次打开还落在上次的面板
+    activeKey.value = ui.controlCenterPanel ?? items.value[0]?.key ?? ''
+    ui.controlCenterPanel = null
     // 知识库 / 记忆数据回拉一次（右栏状态文字与管理列表都读 store）
     void kbStore.refresh()
     // 记下打开前聚焦的元素，关闭时还回去（通常是左下角入口按钮）
@@ -433,6 +522,34 @@ watch(open, (value) => {
     // isConnected 判断：元素若已被卸载就别强塞焦点
     if (lastFocused?.isConnected) lastFocused.focus()
     lastFocused = null
+  }
+})
+
+/**
+ * 切到「一致性检查」就现算一次 —— 这是调查推荐的两个触发点之一（另一个是面板内
+ * 的「重新检查」按钮）。刻意**不**挂在图数据的 watch 上：persist 260ms + 文本字段
+ * 300ms 两道防抖会在打字期间把检查反复叫起来。
+ */
+watch([open, activeKey], () => {
+  if (open.value && activeKey.value === 'consistency') consistency.runCheck()
+})
+
+/**
+ * 外部跳转意图（如 NodeInspector 的「一致性」格 → 控制中心一致性面板）。
+ *
+ * 时序上分两种情况，两个 watch 分工写 activeKey、不抢：
+ *  - 弹窗**未开**：这里只负责把弹窗打开，具体落到哪个面板交给 open watch 的打开
+ *    分支消费（那边读 ui.controlCenterPanel 并清意图）；
+ *  - 弹窗**已开着**：直接切面板并清意图 —— open 值没变，open watch 不会触发，
+ *    不在这儿补位的话意图就没人消费了。
+ */
+// store 状态不能直接当 watch 源（实例上已解包，不是 ref），用 getter 形式（同 KnowledgePanel:138）
+watch(() => ui.controlCenterPanel, (panel) => {
+  if (!panel) return
+  if (!open.value) open.value = true
+  else {
+    activeKey.value = panel
+    ui.controlCenterPanel = null
   }
 })
 
@@ -595,6 +712,69 @@ onBeforeUnmount(() => {
 
                 <p class="nf-cc-mem__privacy">记忆内容仅保存在本机（userData/novelflow.db），可随时导出或删除。</p>
                 <input ref="memFileInput" type="file" accept=".json,application/json" hidden @change="onMemFile" />
+              </template>
+
+              <!-- 一致性检查：专属渲染分支（计数 + 重新检查 + 问题列表 + AI 语义项开关）。
+                   列表区 max-height + 内部滚动，别把 760×500 的弹窗撑爆 -->
+              <template v-else-if="current.panel === 'consistency'">
+                <h3 class="nf-cc-modal__content-title">{{ current.title }}</h3>
+                <p :id="descId" class="nf-cc-modal__desc">{{ current.desc }}</p>
+
+                <!-- 计数行：报告未跑时整行隐藏（打开本项即自动跑一次，正常看不到空态） -->
+                <div v-if="consistency.report" class="nf-cc-cons__counts">
+                  <span v-for="s in SEVERITY_ORDER" :key="s" class="nf-cc-cons__count">
+                    <i class="nf-cc-cons__dot" :class="`is-${s}`" aria-hidden="true" />
+                    {{ SEVERITY_LABEL[s] }}
+                    <b>{{ consistency.report?.counts[s] ?? 0 }}</b>
+                  </span>
+                </div>
+
+                <!-- 操作行：重新检查 + 报告时间 -->
+                <div class="nf-cc-cons__actions">
+                  <button class="nf-cc-cons__rerun" @click="consistency.runCheck()">重新检查</button>
+                  <span v-if="consistency.report" class="nf-cc-cons__time nf-mono-label">
+                    检查于 {{ checkedTimeOf(consistency.report.checkedAt) }}
+                  </span>
+                  <span v-else class="nf-cc-cons__time nf-mono-label">打开后自动检查一次</span>
+                </div>
+
+                <!-- 问题列表：整项可点 → 选中这些节点并展开检查器 -->
+                <template v-if="consistency.report">
+                  <ul v-if="issueList.length" class="nf-cc-cons__list nf-scroll">
+                    <li
+                      v-for="issue in issueList"
+                      :key="issue.id"
+                      class="nf-cc-cons__item"
+                      @click="onIssueClick(issue)"
+                    >
+                      <i class="nf-cc-cons__dot" :class="`is-${issue.severity}`" aria-hidden="true" />
+                      <span class="nf-cc-cons__item-body">
+                        <span class="nf-cc-cons__item-msg">{{ issue.message }}</span>
+                        <span class="nf-cc-cons__item-nodes">{{ titlesOf(issue.nodeIds) }}</span>
+                        <span v-if="issue.hint" class="nf-cc-cons__item-hint">{{ issue.hint }}</span>
+                      </span>
+                    </li>
+                  </ul>
+                  <p v-else class="nf-cc-cons__empty">没有发现问题，时间线很干净。</p>
+                </template>
+
+                <!-- AI 语义检查（实验）：只登记选择，不真调 AI -->
+                <div class="nf-cc-cons__ai">
+                  <span class="nf-cc-cons__ai-title">AI 语义检查（实验）</span>
+                  <p class="nf-cc-cons__ai-desc">
+                    语义项需要配置 AI 模型后才能工作；当前仅登记你的选择，不会真正调用 AI。
+                  </p>
+                  <div class="nf-cc-cons__ai-list">
+                    <label v-for="r in aiRules" :key="r.id" class="nf-cc-cons__ai-item" :title="r.desc">
+                      <input
+                        type="checkbox"
+                        :checked="aiRuleOn[r.id] ?? false"
+                        @change="onAiRuleChange(r.id, $event)"
+                      />
+                      <span>{{ r.label }}</span>
+                    </label>
+                  </div>
+                </div>
               </template>
 
               <!-- 标准设置项骨架 -->
@@ -1059,6 +1239,178 @@ onBeforeUnmount(() => {
   font-size: var(--nf-fs-2xs);
   letter-spacing: 0.02em;
   color: var(--nf-on-dark-faint);
+}
+
+/* ---------- 一致性检查（右栏专属分支） ---------- */
+/* 与记忆分支同构：右栏整体可滚动，问题列表再套一层 max-height + 内部滚动，
+   两级滚动分担高度，绝不把 760×500 的面板撑爆 */
+
+/* 计数行：三个严重级一排点出来，数字加粗用等宽数字，避免跳动 */
+.nf-cc-cons__counts {
+  margin-top: 16px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.nf-cc-cons__count {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--nf-fs-xs);
+  letter-spacing: 0.04em;
+  color: var(--nf-on-dark-soft);
+}
+.nf-cc-cons__count b {
+  font-weight: 600;
+  color: var(--nf-on-dark-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 严重级色点：error 暖红 / warn 琥珀 / info 青（语义色一律去饱和，暗底可读，禁纯黑） */
+.nf-cc-cons__dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--nf-r-chip);
+  background: var(--nf-on-dark-faint);
+}
+.nf-cc-cons__dot.is-error {
+  background: var(--nf-danger);
+}
+.nf-cc-cons__dot.is-warn {
+  background: var(--nf-warn);
+}
+.nf-cc-cons__dot.is-info {
+  background: var(--nf-teal);
+}
+
+/* 操作行：重新检查按钮 + 报告时间（时间贴右，mono 小字） */
+.nf-cc-cons__actions {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.nf-cc-cons__rerun {
+  appearance: none;
+  border: 1px solid rgba(77, 208, 217, 0.42);
+  background: rgba(77, 208, 217, 0.14);
+  color: var(--nf-teal);
+  height: 30px;
+  padding: 0 14px;
+  border-radius: var(--nf-r-ctl);
+  cursor: pointer;
+  font-size: var(--nf-fs-xs);
+  letter-spacing: 0.04em;
+  transition:
+    background var(--nf-dur-fast) var(--nf-ease),
+    border-color var(--nf-dur-fast) var(--nf-ease);
+}
+.nf-cc-cons__rerun:hover {
+  background: rgba(77, 208, 217, 0.22);
+  border-color: rgba(77, 208, 217, 0.6);
+}
+.nf-cc-cons__time {
+  margin-left: auto;
+}
+
+/* 问题列表：可点整项，hover 给微反馈（点了会选中节点 + 开检查器） */
+.nf-cc-cons__list {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 180px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.nf-cc-cons__item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--nf-r-ctl);
+  background: var(--nf-shell-700);
+  border: 1px solid var(--nf-shell-line-soft);
+  cursor: pointer;
+  transition:
+    border-color var(--nf-dur-fast) var(--nf-ease),
+    background var(--nf-dur-fast) var(--nf-ease);
+}
+.nf-cc-cons__item:hover {
+  border-color: rgba(77, 208, 217, 0.42);
+  background: var(--nf-shell-600);
+}
+/* 色点与首行文字对齐：行高约 1.6 × 12px，点往下沉 5px 附近 */
+.nf-cc-cons__item .nf-cc-cons__dot {
+  margin-top: 5px;
+}
+.nf-cc-cons__item-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.nf-cc-cons__item-msg {
+  font-size: var(--nf-fs-xs);
+  line-height: var(--nf-lh-tight);
+  color: var(--nf-on-dark);
+}
+/* 涉及节点：小字弱化，一眼扫过时不抢 message */
+.nf-cc-cons__item-nodes {
+  font-size: var(--nf-fs-2xs);
+  line-height: 1.6;
+  color: var(--nf-on-dark-soft);
+}
+/* 修复建议：比节点标题再弱一档 */
+.nf-cc-cons__item-hint {
+  font-size: var(--nf-fs-2xs);
+  line-height: 1.6;
+  color: var(--nf-on-dark-faint);
+}
+.nf-cc-cons__empty {
+  margin: 12px 0 0;
+  font-size: var(--nf-fs-xs);
+  line-height: 1.7;
+  color: var(--nf-on-dark-faint);
+}
+
+/* AI 语义检查（实验）：与上文用软分隔线隔开，checkbox 复用青色 accent */
+.nf-cc-cons__ai {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--nf-shell-line-soft);
+}
+.nf-cc-cons__ai-title {
+  display: block;
+  font-size: var(--nf-fs-2xs);
+  letter-spacing: 0.06em;
+  color: var(--nf-on-dark-faint);
+}
+.nf-cc-cons__ai-desc {
+  margin: 6px 0 0;
+  font-size: var(--nf-fs-2xs);
+  line-height: 1.7;
+  color: var(--nf-on-dark-faint);
+  max-width: 46em;
+}
+.nf-cc-cons__ai-list {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+}
+.nf-cc-cons__ai-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--nf-fs-xs);
+  color: var(--nf-on-dark);
+  cursor: pointer;
+}
+.nf-cc-cons__ai-item input {
+  accent-color: var(--nf-teal);
 }
 
 @keyframes nf-cc-modal-fade {
